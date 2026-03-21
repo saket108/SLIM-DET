@@ -1,12 +1,13 @@
 # training/task_aligned_assigner.py
 """
-Task-Aligned Label Assigner — from YOLOv8.
-Replaces Hungarian matching O(n³) with O(n) assignment.
-For each GT, selects top-k predictions via: cls^alpha * iou^beta
+Task-aligned label assigner used by the loss.
+
+For each ground-truth box, it selects top-k candidate queries using
+cls_score^alpha * IoU^beta, then resolves conflicts by keeping the
+highest-alignment match per query.
 """
 
 import torch
-import torch.nn.functional as F
 
 
 def box_iou(boxes1, boxes2):
@@ -46,12 +47,13 @@ class TaskAlignedAssigner:
         self.topk=topk; self.alpha=alpha; self.beta=beta; self.num_classes=num_classes
 
     @torch.no_grad()
-    def assign(self, pred_scores, pred_boxes, gt_labels, gt_boxes):
+    def assign(self, pred_scores, pred_boxes, gt_boxes, gt_labels, gt_severity=None):
         Q = pred_scores.size(0); G = gt_boxes.size(0); device = pred_boxes.device
         if G == 0:
             return (torch.full((Q,),-1,dtype=torch.long,device=device),
                     torch.zeros(Q,4,device=device),
-                    torch.zeros(Q,self.num_classes,device=device))
+                    torch.zeros(Q,device=device),
+                    torch.zeros(Q,dtype=torch.bool,device=device))
         iou = box_iou(pred_boxes, gt_boxes)
         cls_scores = pred_scores.sigmoid()[:, gt_labels]
         align = (cls_scores**self.alpha) * (iou**self.beta)
@@ -59,18 +61,22 @@ class TaskAlignedAssigner:
         _, topk_idxs = align.topk(topk, dim=0)
         is_assigned = torch.zeros(Q, G, dtype=torch.bool, device=device)
         is_assigned.scatter_(0, topk_idxs, True)
-        max_metric, assigned_gt = (align * is_assigned.float()).max(dim=1)
+        aligned_metric = align * is_assigned.float()
+        max_metric, assigned_gt = aligned_metric.max(dim=1)
         labels = torch.full((Q,),-1,dtype=torch.long,device=device)
         boxes  = torch.zeros(Q,4,device=device)
-        scores = torch.zeros(Q,self.num_classes,device=device)
-        pos = is_assigned.any(dim=1)
+        severity = torch.zeros(Q,device=device)
+        pos = max_metric > 0
         if pos.any():
             gi = assigned_gt[pos]
             labels[pos] = gt_labels[gi]
             boxes[pos]  = gt_boxes[gi]
-            nm = align[pos, gi]; nm = nm/(nm.max()+1e-6)
-            scores[pos, gt_labels[gi]] = nm
-        return labels, boxes, scores
+            if gt_severity is not None:
+                severity[pos] = gt_severity[gi]
+        return labels, boxes, severity, pos
+
+    def __call__(self, pred_scores, pred_boxes, gt_boxes, gt_labels, gt_severity=None):
+        return self.assign(pred_scores, pred_boxes, gt_boxes, gt_labels, gt_severity)
 
 
 if __name__ == '__main__':
@@ -79,7 +85,11 @@ if __name__ == '__main__':
     pred_boxes  = torch.rand(90, 4)
     gt_labels   = torch.tensor([0, 1, 3])
     gt_boxes    = torch.tensor([[0.5,0.5,0.2,0.2],[0.2,0.3,0.1,0.15],[0.7,0.6,0.3,0.25]])
-    labels, boxes, scores = assigner.assign(pred_scores, pred_boxes, gt_labels, gt_boxes)
-    print(f"Positives   : {(labels>=0).sum().item()} / 90")
+    gt_severity = torch.tensor([0.2, 0.4, 0.8])
+    labels, boxes, severity, pos = assigner.assign(
+        pred_scores, pred_boxes, gt_boxes, gt_labels, gt_severity
+    )
+    print(f"Positives   : {pos.sum().item()} / 90")
     print(f"labels shape: {labels.shape}")
+    print(f"severity shape: {severity.shape}")
     print("task_aligned_assigner.py works correctly")

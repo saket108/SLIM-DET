@@ -8,13 +8,18 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
+
+try:
+    import timm
+except ImportError:
+    timm = None
 
 from model.text_encoder    import TextEncoder
 from model.zone_encoder    import ZoneEncoder
 from model.metrics_encoder import MetricsEncoder, MetricsNormalizer
 from model.smfe            import SMFE
 from model.cafpn           import CAFPN
+from model.ghost_csp_backbone import GhostCSPBackbone
 from model.sgqi            import SGQI
 from model.rwda_decoder    import RWDADecoder
 from model.detector_head   import DetectorHead
@@ -29,14 +34,6 @@ class PretrainedBackbone(nn.Module):
     Default: ConvNeXtV2-Tiny pretrained on ImageNet-22k
     — strong features, 28M params, 4 clean hierarchical stages.
     """
-    CHANNEL_MAP = {
-        'convnextv2_tiny.fcmae_ft_in22k_in1k':  [96, 192, 384, 768],
-        'convnextv2_base.fcmae_ft_in22k_in1k':  [128, 256, 512, 1024],
-        'convnext_tiny.in12k_ft_in1k':           [96, 192, 384, 768],
-        'efficientnet_b3.ra2_in1k':              [32, 48, 136, 384],
-        'resnet50.a1_in1k':                      [256, 512, 1024, 2048],
-    }
-
     def __init__(
         self,
         model_name: str = 'convnextv2_tiny.fcmae_ft_in22k_in1k',
@@ -45,16 +42,53 @@ class PretrainedBackbone(nn.Module):
     ):
         super().__init__()
         self.model_name = model_name
+        self.using_timm = False
+        self.apply_post_film = False
 
-        print(f"  Loading backbone: {model_name} (pretrained={pretrained})")
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained    = pretrained,
-            features_only = True,
-            out_indices   = (0, 1, 2, 3),
-        )
-
-        in_channels = self.CHANNEL_MAP.get(model_name, [96, 192, 384, 768])
+        in_channels = [64, 128, 256, 512]
+        if timm is not None:
+            try:
+                print(f"  Loading backbone: {model_name} (pretrained={pretrained})")
+                self.backbone = timm.create_model(
+                    model_name,
+                    pretrained=pretrained,
+                    features_only=True,
+                    out_indices=(0, 1, 2, 3),
+                )
+                in_channels = list(self.backbone.feature_info.channels())
+                self.using_timm = True
+                self.apply_post_film = True
+            except Exception as exc:
+                if pretrained:
+                    try:
+                        print(f"  Retrying backbone without pretrained weights: {exc}")
+                        self.backbone = timm.create_model(
+                            model_name,
+                            pretrained=False,
+                            features_only=True,
+                            out_indices=(0, 1, 2, 3),
+                        )
+                        in_channels = list(self.backbone.feature_info.channels())
+                        self.using_timm = True
+                        self.apply_post_film = True
+                    except Exception as fallback_exc:
+                        print(f"  Falling back to GhostCSPBackbone: {fallback_exc}")
+                        self.backbone = GhostCSPBackbone(
+                            channels=in_channels,
+                            hidden_dim=hidden_dim,
+                        )
+                else:
+                    print(f"  Falling back to GhostCSPBackbone: {exc}")
+                    self.backbone = GhostCSPBackbone(
+                        channels=in_channels,
+                        hidden_dim=hidden_dim,
+                    )
+        else:
+            print("  timm not installed - using GhostCSPBackbone fallback")
+            self.backbone = GhostCSPBackbone(
+                channels=in_channels,
+                hidden_dim=hidden_dim,
+            )
 
         # Lateral projections: backbone channels → hidden_dim
         self.laterals = nn.ModuleList([
@@ -78,11 +112,14 @@ class PretrainedBackbone(nn.Module):
             nn.init.zeros_(b.weight); nn.init.zeros_(b.bias)
 
     def forward(self, x, metrics_emb=None):
-        raw_feats = self.backbone(x)
+        if self.using_timm:
+            raw_feats = self.backbone(x)
+        else:
+            raw_feats = self.backbone(x, metrics_emb)
         feats = [l(f) for l, f in zip(self.laterals, raw_feats)]
 
         # FiLM condition last 2 stages with damage metrics
-        if metrics_emb is not None:
+        if self.apply_post_film and metrics_emb is not None:
             for i, (g, b) in enumerate(zip(self.film_gamma, self.film_beta)):
                 idx   = i + 2   # stages 2 and 3
                 gamma = g(metrics_emb).view(-1, feats[idx].size(1), 1, 1)
@@ -104,31 +141,42 @@ class SLIMDet(nn.Module):
         backbone_name: str  = 'convnextv2_tiny.fcmae_ft_in22k_in1k',
         prompt_mode:   str  = 'full',
         freeze_text:   bool = True,
+        text_local_files_only: bool = False,
+        pretrained_backbone: bool = True,
+        image_only:    bool = False,
         use_scf:       bool = True,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.hidden_dim  = hidden_dim
         self.num_queries = num_queries
+        self.image_only  = image_only
         self.use_scf     = use_scf
 
-        # ── Encoders ──────────────────────────────────────────
-        self.text_encoder    = TextEncoder(
-            model_name = text_model,
-            hidden_dim = hidden_dim,
-            pooling    = 'mean',
-            freeze     = freeze_text,
-        )
-        self.zone_encoder    = ZoneEncoder(hidden_dim=hidden_dim)
-        self.metrics_norm    = MetricsNormalizer()
-        self.metrics_encoder = MetricsEncoder(input_dim=4, hidden_dim=hidden_dim)
-        self.smfe            = SMFE(hidden_dim=hidden_dim, num_heads=4)
+        # ── Encoders / image-only baseline branch ─────────────
+        if image_only:
+            self.image_only_queries = nn.Embedding(num_queries, hidden_dim)
+            self.image_only_context = nn.Parameter(torch.zeros(3, hidden_dim))
+            nn.init.normal_(self.image_only_queries.weight, std=0.02)
+            nn.init.normal_(self.image_only_context, std=0.02)
+        else:
+            self.text_encoder    = TextEncoder(
+                model_name = text_model,
+                hidden_dim = hidden_dim,
+                pooling    = 'mean',
+                freeze     = freeze_text,
+                local_files_only = text_local_files_only,
+            )
+            self.zone_encoder    = ZoneEncoder(hidden_dim=hidden_dim)
+            self.metrics_norm    = MetricsNormalizer()
+            self.metrics_encoder = MetricsEncoder(input_dim=4, hidden_dim=hidden_dim)
+            self.smfe            = SMFE(hidden_dim=hidden_dim, num_heads=4)
 
         # ── Pretrained backbone ────────────────────────────────
         self.backbone = PretrainedBackbone(
             model_name = backbone_name,
             hidden_dim = hidden_dim,
-            pretrained = True,
+            pretrained = pretrained_backbone,
         )
         self.cafpn = CAFPN(
             in_channels  = [hidden_dim] * 4,
@@ -157,12 +205,18 @@ class SLIMDet(nn.Module):
             self.scf = SCF(num_classes=num_classes, hidden_dim=hidden_dim)
 
     def forward(self, images, prompts, zones, metrics):
-        # 1. Encode modalities
-        text_emb    = self.text_encoder(prompts)
-        zone_emb    = self.zone_encoder(zones)
-        metrics_emb = self.metrics_encoder(self.metrics_norm(metrics))
-        ctx_tokens, _ = self.smfe(text_emb, zone_emb, metrics_emb)
-        ctx_emb     = ctx_tokens.mean(dim=1)
+        # 1. Encode modalities or use learned visual-only context
+        if self.image_only:
+            batch_size = images.size(0)
+            metrics_emb = None
+            ctx_tokens = self.image_only_context.unsqueeze(0).expand(batch_size, -1, -1)
+            ctx_emb = ctx_tokens.mean(dim=1)
+        else:
+            text_emb    = self.text_encoder(prompts)
+            zone_emb    = self.zone_encoder(zones)
+            metrics_emb = self.metrics_encoder(self.metrics_norm(metrics))
+            ctx_tokens, _ = self.smfe(text_emb, zone_emb, metrics_emb)
+            ctx_emb     = ctx_tokens.mean(dim=1)
 
         # 2. Encode image
         feats = self.backbone(images, metrics_emb)
@@ -172,7 +226,10 @@ class SLIMDet(nn.Module):
         vis_mem = self.visual_proj(p4.flatten(2).permute(0, 2, 1))
 
         # 3. Initialize queries
-        queries = self.sgqi(text_emb, zone_emb, metrics_emb)
+        if self.image_only:
+            queries = self.image_only_queries.weight.unsqueeze(0).expand(B, -1, -1)
+        else:
+            queries = self.sgqi(text_emb, zone_emb, metrics_emb)
 
         # 4. Decode
         queries, aux_list = self.decoder(queries, vis_mem, ctx_tokens)

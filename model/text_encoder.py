@@ -11,9 +11,17 @@ Default model: all-MiniLM-L6-v2 (22M params)
 Supports 4 pooling strategies for ablation.
 """
 
+import hashlib
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
+
+try:
+    from transformers import AutoModel, AutoTokenizer
+except ImportError:
+    AutoModel = None
+    AutoTokenizer = None
 
 
 # ── Supported lightweight models ─────────────────────────────
@@ -53,19 +61,26 @@ class TextEncoder(nn.Module):
         max_length:  int   = 128,
         freeze:      bool  = True,
         dropout:     float = 0.1,
+        local_files_only: bool = False,
+        fallback_dim: int = 256,
+        fallback_vocab_size: int = 8192,
     ):
         super().__init__()
         self.pooling    = pooling
         self.max_length = max_length
         self.hidden_dim = hidden_dim
+        self.uses_fallback = False
 
         # Resolve model name
         hf_name = SUPPORTED_MODELS.get(model_name, model_name)
         print(f"  Loading text encoder: {hf_name}")
 
-        # Load tokenizer + model
-        self.tokenizer = AutoTokenizer.from_pretrained(hf_name)
-        self.transformer = AutoModel.from_pretrained(hf_name)
+        self.tokenizer, self.transformer = self._load_backbone(
+            hf_name=hf_name,
+            local_files_only=local_files_only,
+            hidden_dim=fallback_dim,
+            vocab_size=fallback_vocab_size,
+        )
 
         # Freeze transformer weights (save GPU memory + speed)
         if freeze:
@@ -87,6 +102,41 @@ class TextEncoder(nn.Module):
         )
 
         self._init_proj()
+
+    def _load_backbone(self, hf_name, local_files_only, hidden_dim, vocab_size):
+        if AutoTokenizer is None or AutoModel is None:
+            print("  transformers not installed - using hash-based fallback text encoder")
+            self.uses_fallback = True
+            return _HashTokenizer(vocab_size), _HashTextBackbone(vocab_size, hidden_dim)
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                hf_name,
+                local_files_only=True,
+            )
+            transformer = AutoModel.from_pretrained(
+                hf_name,
+                local_files_only=True,
+            )
+            return tokenizer, transformer
+        except Exception as exc:
+            if not local_files_only:
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        hf_name,
+                        local_files_only=False,
+                    )
+                    transformer = AutoModel.from_pretrained(
+                        hf_name,
+                        local_files_only=False,
+                    )
+                    return tokenizer, transformer
+                except Exception as remote_exc:
+                    exc = remote_exc
+
+            print(f"  Falling back to hash-based text encoder: {exc}")
+            self.uses_fallback = True
+            return _HashTokenizer(vocab_size), _HashTextBackbone(vocab_size, hidden_dim)
 
     def _init_proj(self):
         for m in self.proj.modules():
@@ -171,6 +221,79 @@ class TextEncoder(nn.Module):
     def encode_single(self, prompt: str) -> torch.Tensor:
         """Convenience: encode a single prompt string."""
         return self.forward([prompt])[0]
+
+
+class _HashTokenizer:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def _token_to_id(self, token):
+        digest = hashlib.blake2b(token.encode('utf-8'), digest_size=4).digest()
+        token_id = int.from_bytes(digest, 'little')
+        return 1 + (token_id % (self.vocab_size - 1))
+
+    def __call__(
+        self,
+        prompts,
+        padding=True,
+        truncation=True,
+        max_length=128,
+        return_tensors='pt',
+    ):
+        del padding, truncation, return_tensors
+        encoded_prompts = []
+
+        for prompt in prompts:
+            tokens = prompt.lower().replace('.', ' ').replace(',', ' ').split()
+            tokens = tokens[:max_length]
+            if not tokens:
+                tokens = ['<empty>']
+            encoded_prompts.append([self._token_to_id(token) for token in tokens])
+
+        max_tokens = max(len(tokens) for tokens in encoded_prompts)
+        input_ids = torch.zeros(len(prompts), max_tokens, dtype=torch.long)
+        attention_mask = torch.zeros(len(prompts), max_tokens, dtype=torch.long)
+
+        for idx, token_ids in enumerate(encoded_prompts):
+            token_tensor = torch.tensor(token_ids, dtype=torch.long)
+            input_ids[idx, :len(token_ids)] = token_tensor
+            attention_mask[idx, :len(token_ids)] = 1
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+        }
+
+
+class _HashTextBackbone(nn.Module):
+    def __init__(self, vocab_size, hidden_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim, padding_idx=0)
+        self.encoder = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim // 2,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.config = SimpleNamespace(hidden_size=hidden_dim)
+
+    def forward(self, input_ids, attention_mask):
+        embedded = self.embedding(input_ids)
+        lengths = attention_mask.sum(dim=1).clamp(min=1).cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            embedded,
+            lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_output, _ = self.encoder(packed)
+        output, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_output,
+            batch_first=True,
+            total_length=input_ids.size(1),
+        )
+        return SimpleNamespace(last_hidden_state=self.norm(output))
 
 
 # ── Quick test ────────────────────────────────────────────────

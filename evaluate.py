@@ -1,57 +1,210 @@
-# evaluate.py
 """
 SLIM-Det evaluation script.
-Computes mAP50, mAP50-95, and per-class AP on the test set.
 
-Usage:
-    python evaluate.py --checkpoint runs/slim_det/slim_det_best.pt
-    python evaluate.py --checkpoint runs/slim_det/slim_det_best.pt --split test
-    python evaluate.py --checkpoint runs/slim_det/slim_det_best.pt --prompt_mode cat_only
+Computes mAP50, mAP50-95, precision, recall, and F1 on the
+validation or test split.
 """
 
-import os
 import argparse
-import torch
-import numpy as np
+import os
 from collections import defaultdict
 
-from model.slim_det  import SLIMDet
-from data.loader     import build_val_loader, AircraftDataset
-from data.prompt_builder import CLASS_ID_TO_NAME
+import numpy as np
+import torch
 
-# ── Dataset paths ─────────────────────────────────────────────
-DATASET_ROOT = r'C:\Users\tsake\OneDrive\Desktop\Aircraft_dataset\content\Aircraft_dataset'
-VAL_JSON     = os.path.join(DATASET_ROOT, 'Aircraft_val.json')
-TEST_JSON    = os.path.join(DATASET_ROOT, 'Aircraft_test.json')
-VAL_IMAGES   = os.path.join(DATASET_ROOT, 'images', 'val')
-TEST_IMAGES  = os.path.join(DATASET_ROOT, 'images', 'test')
+from data.loader import build_batch_context, build_val_loader
+from data.prompt_builder import CLASS_ID_TO_NAME
+from model.slim_det import SLIMDet
+from utils.runtime import (
+    coalesce,
+    load_yaml_config,
+    require_existing_paths,
+    resolve_dataset_paths,
+)
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint',  type=str, default=None)
-    p.add_argument('--split',       type=str, default='val',
-                   choices=['val', 'test'])
-    p.add_argument('--prompt_mode', type=str, default='full')
-    p.add_argument('--batch',       type=int, default=4)
-    p.add_argument('--imgsz',       type=int, default=640)
-    p.add_argument('--conf',        type=float, default=0.25)
-    p.add_argument('--iou_thresh',  type=float, default=0.5)
-    p.add_argument('--workers',     type=int, default=0)
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description='Evaluate SLIM-Det')
+    parser.add_argument('--config', type=str, default='configs/slim_det.yaml')
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--split', type=str, default='val', choices=['val', 'test'])
+    parser.add_argument('--dataset_root', type=str, default=None)
+    parser.add_argument('--val_json', type=str, default=None)
+    parser.add_argument('--test_json', type=str, default=None)
+    parser.add_argument('--val_images', type=str, default=None)
+    parser.add_argument('--test_images', type=str, default=None)
+    parser.add_argument('--prompt_mode', type=str, default=None)
+    parser.add_argument('--batch', type=int, default=None)
+    parser.add_argument('--imgsz', type=int, default=None)
+    parser.add_argument('--hidden_dim', type=int, default=None)
+    parser.add_argument('--num_queries', type=int, default=None)
+    parser.add_argument('--num_layers', type=int, default=None)
+    parser.add_argument('--conf', type=float, default=None)
+    parser.add_argument('--iou_thresh', type=float, default=None)
+    parser.add_argument('--nms_iou', type=float, default=None)
+    parser.add_argument('--workers', type=int, default=None)
+    parser.add_argument('--max_batches', type=int, default=None)
+    parser.add_argument('--text_model', type=str, default=None)
+    parser.add_argument('--backbone_name', type=str, default=None)
+    parser.add_argument('--no_scf', action='store_true')
+    parser.add_argument('--image_only', dest='image_only', action='store_true')
+    parser.add_argument('--multimodal', dest='image_only', action='store_false')
+    parser.add_argument('--freeze_text', dest='freeze_text', action='store_true')
+    parser.add_argument('--train_text', dest='freeze_text', action='store_false')
+    parser.add_argument('--no_pretrained_backbone', action='store_true')
+    parser.set_defaults(freeze_text=None, image_only=None)
+    return parser.parse_args()
+
+
+def resolve_args(args):
+    config = load_yaml_config(args.config)
+    model_cfg = config.get('model', {})
+    data_cfg = config.get('data', {})
+    prompt_cfg = config.get('prompt', {})
+    train_cfg = config.get('train', {})
+    eval_cfg = config.get('eval', {})
+
+    dataset_root = coalesce(args.dataset_root, data_cfg.get('dataset_root'))
+    _, val_json, val_images = resolve_dataset_paths(
+        dataset_root=dataset_root,
+        data_config=data_cfg,
+        split='val',
+        json_path=args.val_json,
+        images_dir=args.val_images,
+    )
+    dataset_root, test_json, test_images = resolve_dataset_paths(
+        dataset_root=dataset_root,
+        data_config=data_cfg,
+        split='test',
+        json_path=args.test_json,
+        images_dir=args.test_images,
+    )
+
+    split_json = test_json if args.split == 'test' else val_json
+    split_images = test_images if args.split == 'test' else val_images
+
+    resolved = {
+        'config': args.config,
+        'checkpoint': args.checkpoint,
+        'split': args.split,
+        'dataset_root': dataset_root,
+        'json_path': split_json,
+        'images_dir': split_images,
+        'prompt_mode': coalesce(args.prompt_mode, prompt_cfg.get('mode'), 'full'),
+        'batch': coalesce(args.batch, eval_cfg.get('batch_size'), train_cfg.get('batch_size'), 4),
+        'imgsz': coalesce(args.imgsz, train_cfg.get('image_size'), data_cfg.get('image_size'), 640),
+        'hidden_dim': coalesce(args.hidden_dim, model_cfg.get('hidden_dim'), 256),
+        'num_queries': coalesce(args.num_queries, model_cfg.get('num_queries'), 90),
+        'num_layers': coalesce(args.num_layers, model_cfg.get('num_layers'), 4),
+        'conf': coalesce(args.conf, eval_cfg.get('conf_thresh'), 0.25),
+        'iou_thresh': coalesce(args.iou_thresh, eval_cfg.get('iou_thresh'), 0.5),
+        'nms_iou': coalesce(args.nms_iou, eval_cfg.get('nms_iou'), 0.6),
+        'workers': (
+            args.workers
+            if args.workers is not None
+            else (0 if os.name == 'nt' else coalesce(train_cfg.get('num_workers'), 0))
+        ),
+        'max_batches': args.max_batches,
+        'text_model': coalesce(args.text_model, model_cfg.get('text_model'), 'minilm'),
+        'backbone_name': coalesce(
+            args.backbone_name,
+            model_cfg.get('backbone_name'),
+            'convnextv2_tiny.fcmae_ft_in22k_in1k',
+        ),
+        'image_only': coalesce(args.image_only, model_cfg.get('image_only'), False),
+        'freeze_text': coalesce(args.freeze_text, model_cfg.get('freeze_text'), True),
+        'use_scf': not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True),
+        'pretrained_backbone': (
+            False if args.no_pretrained_backbone
+            else coalesce(model_cfg.get('pretrained_backbone'), True)
+        ),
+    }
+
+    require_existing_paths(json_path=resolved['json_path'], images_dir=resolved['images_dir'])
+    if resolved['checkpoint'] is not None:
+        resolved['checkpoint'] = resolve_checkpoint_path(
+            resolved['checkpoint'],
+            config=config,
+        )
+    return argparse.Namespace(**resolved)
+
+
+def resolve_checkpoint_path(checkpoint_arg, config):
+    """Resolve checkpoint aliases and produce a helpful error if missing."""
+    checkpoint_cfg = config.get('checkpoint', {})
+    save_dir = checkpoint_cfg.get('save_dir', 'runs/slim_det')
+
+    aliases = {
+        'best': os.path.join(save_dir, 'slim_det_best.pt'),
+        'last': os.path.join(save_dir, 'slim_det_last.pt'),
+        'latest': os.path.join(save_dir, 'slim_det_last.pt'),
+    }
+    candidate = aliases.get(checkpoint_arg, checkpoint_arg)
+
+    if os.path.exists(candidate):
+        return candidate
+
+    checkpoint_files = []
+    if os.path.isdir(save_dir):
+        checkpoint_files = sorted(
+            [
+                os.path.join(save_dir, name)
+                for name in os.listdir(save_dir)
+                if name.endswith(('.pt', '.pth'))
+            ]
+        )
+
+    if checkpoint_files:
+        available = ", ".join(checkpoint_files)
+        raise FileNotFoundError(
+            f"Checkpoint not found: '{candidate}'. Available checkpoints: {available}"
+        )
+
+    raise FileNotFoundError(
+        f"Checkpoint not found: '{candidate}'. No checkpoint files were found under "
+        f"'{save_dir}'. Train the model first or pass the correct checkpoint path."
+    )
+
+
+def apply_checkpoint_model_config(args, checkpoint):
+    """Prefer architecture settings stored in the checkpoint."""
+    model_config = checkpoint.get('model_config')
+    if not model_config:
+        return args
+
+    for key in (
+        'hidden_dim',
+        'num_queries',
+        'num_layers',
+        'text_model',
+        'backbone_name',
+        'prompt_mode',
+        'freeze_text',
+        'pretrained_backbone',
+        'image_only',
+        'use_scf',
+    ):
+        if key in model_config:
+            setattr(args, key, model_config[key])
+
+    return args
 
 
 def box_iou(boxes1, boxes2):
-    """
-    Compute IoU between two sets of boxes.
-    boxes: [N, 4] in cx,cy,w,h normalized format
-    """
-    def to_xyxy(b):
+    """Compute IoU between two sets of normalized cxcywh boxes."""
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros(
+            (boxes1.shape[0], boxes2.shape[0]),
+            dtype=boxes1.dtype,
+            device=boxes1.device,
+        )
+
+    def to_xyxy(boxes):
         return torch.stack([
-            b[:, 0] - b[:, 2] / 2,
-            b[:, 1] - b[:, 3] / 2,
-            b[:, 0] + b[:, 2] / 2,
-            b[:, 1] + b[:, 3] / 2,
+            boxes[:, 0] - boxes[:, 2] / 2,
+            boxes[:, 1] - boxes[:, 3] / 2,
+            boxes[:, 0] + boxes[:, 2] / 2,
+            boxes[:, 1] + boxes[:, 3] / 2,
         ], dim=1)
 
     b1 = to_xyxy(boxes1)
@@ -62,237 +215,386 @@ def box_iou(boxes1, boxes2):
     inter_x2 = torch.min(b1[:, None, 2], b2[None, :, 2])
     inter_y2 = torch.min(b1[:, None, 3], b2[None, :, 3])
 
-    inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-    area1 = b1[:, 2] * b1[:, 3]
-    area2 = b2[:, 2] * b2[:, 3]
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    area1 = (b1[:, 2] - b1[:, 0]).clamp(min=0) * (b1[:, 3] - b1[:, 1]).clamp(min=0)
+    area2 = (b2[:, 2] - b2[:, 0]).clamp(min=0) * (b2[:, 3] - b2[:, 1]).clamp(min=0)
     union = area1[:, None] + area2[None, :] - inter
-
     return inter / union.clamp(min=1e-6)
 
 
+def nms_cxcywh(boxes, scores, iou_threshold):
+    """Simple NMS for normalized cxcywh boxes."""
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = scores.argsort(descending=True)
+    keep = []
+
+    while order.numel() > 0:
+        current = order[0]
+        keep.append(current)
+
+        if order.numel() == 1:
+            break
+
+        remaining = order[1:]
+        ious = box_iou(boxes[current].unsqueeze(0), boxes[remaining])[0]
+        order = remaining[ious <= iou_threshold]
+
+    return torch.stack(keep)
+
+
+def prepare_image_predictions(score_matrix, boxes, conf_thresh=0.25, nms_iou=0.6):
+    """Convert raw query outputs into one labeled detection per kept query."""
+    confidences, labels = score_matrix.max(dim=-1)
+    keep = confidences >= conf_thresh
+
+    boxes = boxes[keep]
+    score_matrix = score_matrix[keep]
+    confidences = confidences[keep]
+    labels = labels[keep]
+
+    if boxes.numel() == 0:
+        return {
+            'boxes': boxes.cpu(),
+            'scores': score_matrix.cpu(),
+            'labels': labels.cpu(),
+            'confidences': confidences.cpu(),
+        }
+
+    if nms_iou is not None:
+        kept_indices = []
+        for cls_id in labels.unique(sorted=True):
+            cls_mask = labels == cls_id
+            cls_indices = torch.nonzero(cls_mask, as_tuple=False).squeeze(1)
+            cls_keep = nms_cxcywh(
+                boxes[cls_mask],
+                confidences[cls_mask],
+                iou_threshold=nms_iou,
+            )
+            kept_indices.append(cls_indices[cls_keep])
+
+        if kept_indices:
+            keep_idx = torch.cat(kept_indices)
+            keep_idx = keep_idx[confidences[keep_idx].argsort(descending=True)]
+            boxes = boxes[keep_idx]
+            score_matrix = score_matrix[keep_idx]
+            confidences = confidences[keep_idx]
+            labels = labels[keep_idx]
+
+    return {
+        'boxes': boxes.cpu(),
+        'scores': score_matrix.cpu(),
+        'labels': labels.cpu(),
+        'confidences': confidences.cpu(),
+    }
+
+
 def compute_ap(recall, precision):
-    """Compute AP using 11-point interpolation."""
-    ap = 0.0
-    for t in np.linspace(0, 1, 11):
-        prec = precision[recall >= t]
-        ap += prec.max() if len(prec) > 0 else 0.0
-    return ap / 11.0
+    """Compute AP from the precision envelope."""
+    if len(recall) == 0 or len(precision) == 0:
+        return 0.0
+
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+    mpre = np.maximum.accumulate(mpre[::-1])[::-1]
+    indices = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(np.sum((mrec[indices + 1] - mrec[indices]) * mpre[indices + 1]))
 
 
 def evaluate_predictions(all_preds, all_targets, num_classes, iou_threshold=0.5):
-    """
-    Compute per-class AP and mAP.
-
-    all_preds  : list of dicts {boxes:[N,4], scores:[N,C], labels:[N]}
-    all_targets: list of dicts {boxes:[M,4], labels:[M]}
-    """
-    class_aps = {}
+    """Return per-class AP, precision, recall, and F1."""
+    class_metrics = {}
 
     for cls_id in range(num_classes):
-        tp_list    = []
-        score_list = []
-        n_gt       = 0
+        detections = []
+        tp_count = 0
+        fp_count = 0
+        n_gt = 0
 
         for preds, targets in zip(all_preds, all_targets):
-            gt_boxes  = targets['boxes']
+            gt_boxes = targets['boxes']
             gt_labels = targets['labels']
 
-            # Filter GT for this class
-            gt_mask  = gt_labels == cls_id
+            gt_mask = gt_labels == cls_id
             gt_boxes_cls = gt_boxes[gt_mask]
-            n_gt    += gt_boxes_cls.shape[0]
+            n_gt += gt_boxes_cls.shape[0]
 
-            # Filter predictions for this class
-            pred_boxes  = preds['boxes']
-            pred_scores = preds['scores'][:, cls_id]
-            pred_mask   = pred_scores >= 0.0   # keep all, sort by score
-            pred_boxes  = pred_boxes[pred_mask]
-            pred_scores = pred_scores[pred_mask]
+            pred_mask = preds['labels'] == cls_id
+            pred_boxes = preds['boxes'][pred_mask]
+            pred_scores = preds['confidences'][pred_mask]
 
-            # Sort by score descending
-            order       = pred_scores.argsort(descending=True)
-            pred_boxes  = pred_boxes[order]
-            pred_scores = pred_scores[order].cpu().numpy()
+            if pred_scores.numel() > 0:
+                order = pred_scores.argsort(descending=True)
+                pred_boxes = pred_boxes[order]
+                pred_scores = pred_scores[order]
 
             matched = torch.zeros(gt_boxes_cls.shape[0], dtype=torch.bool)
 
-            for i, pb in enumerate(pred_boxes):
-                score_list.append(pred_scores[i])
+            for idx, pred_box in enumerate(pred_boxes):
+                score = float(pred_scores[idx])
+                is_true_positive = 0
 
-                if gt_boxes_cls.shape[0] == 0:
-                    tp_list.append(0)
-                    continue
+                if gt_boxes_cls.shape[0] > 0:
+                    ious = box_iou(pred_box.unsqueeze(0), gt_boxes_cls)[0]
+                    best_iou, best_j = ious.max(0)
+                    if best_iou >= iou_threshold and not matched[best_j]:
+                        matched[best_j] = True
+                        is_true_positive = 1
 
-                ious    = box_iou(pb.unsqueeze(0), gt_boxes_cls)[0]
-                best_iou, best_j = ious.max(0) if len(ious) > 0 else (torch.tensor(0.), torch.tensor(0))
+                detections.append((score, is_true_positive))
+                tp_count += is_true_positive
+                fp_count += 1 - is_true_positive
 
-                if best_iou >= iou_threshold and not matched[best_j]:
-                    matched[best_j] = True
-                    tp_list.append(1)
-                else:
-                    tp_list.append(0)
+        fn_count = max(n_gt - tp_count, 0)
+        precision_value = tp_count / max(tp_count + fp_count, 1)
+        recall_value = tp_count / max(n_gt, 1)
+        f1_value = (
+            2 * precision_value * recall_value / max(precision_value + recall_value, 1e-12)
+            if (precision_value + recall_value) > 0
+            else 0.0
+        )
 
-        if n_gt == 0:
-            class_aps[cls_id] = 0.0
-            continue
+        if detections and n_gt > 0:
+            score_arr = np.array([score for score, _ in detections], dtype=np.float32)
+            tp_arr = np.array([tp for _, tp in detections], dtype=np.float32)
+            order = score_arr.argsort()[::-1]
+            tp_arr = tp_arr[order]
 
-        tp_arr    = np.array(tp_list)
-        score_arr = np.array(score_list)
-        order     = score_arr.argsort()[::-1]
-        tp_arr    = tp_arr[order]
-
-        cum_tp = np.cumsum(tp_arr)
-        cum_fp = np.cumsum(1 - tp_arr)
-
-        recall    = cum_tp / n_gt
-        precision = cum_tp / (cum_tp + cum_fp + 1e-6)
-
-        class_aps[cls_id] = compute_ap(recall, precision)
-
-    return class_aps
-
-
-def collate_targets_eval(targets, device):
-    prompts, zones, metrics = [], [], []
-    for t in targets:
-        if t['num_anns'] > 0:
-            prompts.append(t['prompts'][0])
-            zones.append(t['zones'][0])
-            metrics.append(t['metrics'][0])
+            cum_tp = np.cumsum(tp_arr)
+            cum_fp = np.cumsum(1.0 - tp_arr)
+            recall_curve = cum_tp / max(n_gt, 1)
+            precision_curve = cum_tp / np.maximum(cum_tp + cum_fp, 1e-6)
+            ap_value = compute_ap(recall_curve, precision_curve)
         else:
-            prompts.append("No damage detected.")
-            zones.append('unknown')
-            metrics.append(torch.zeros(4))
-    metrics = torch.stack(metrics).to(device)
-    return prompts, zones, metrics
+            ap_value = 0.0
+
+        class_metrics[cls_id] = {
+            'ap': float(ap_value),
+            'precision': float(precision_value),
+            'recall': float(recall_value),
+            'f1': float(f1_value),
+            'tp': int(tp_count),
+            'fp': int(fp_count),
+            'fn': int(fn_count),
+            'num_gt': int(n_gt),
+        }
+
+    return class_metrics
+
+
+def summarize_metrics(class_metrics):
+    macro_precision = np.mean([metrics['precision'] for metrics in class_metrics.values()])
+    macro_recall = np.mean([metrics['recall'] for metrics in class_metrics.values()])
+    macro_f1 = np.mean([metrics['f1'] for metrics in class_metrics.values()])
+
+    total_tp = sum(metrics['tp'] for metrics in class_metrics.values())
+    total_fp = sum(metrics['fp'] for metrics in class_metrics.values())
+    total_fn = sum(metrics['fn'] for metrics in class_metrics.values())
+
+    micro_precision = total_tp / max(total_tp + total_fp, 1)
+    micro_recall = total_tp / max(total_tp + total_fn, 1)
+    micro_f1 = (
+        2 * micro_precision * micro_recall / max(micro_precision + micro_recall, 1e-12)
+        if (micro_precision + micro_recall) > 0
+        else 0.0
+    )
+
+    return {
+        'macro_precision': float(macro_precision),
+        'macro_recall': float(macro_recall),
+        'macro_f1': float(macro_f1),
+        'micro_precision': float(micro_precision),
+        'micro_recall': float(micro_recall),
+        'micro_f1': float(micro_f1),
+        'total_tp': int(total_tp),
+        'total_fp': int(total_fp),
+        'total_fn': int(total_fn),
+    }
 
 
 @torch.no_grad()
-def run_evaluation(model, loader, device, conf_thresh=0.25, iou_thresh=0.5):
+def run_evaluation(
+    model,
+    loader,
+    device,
+    conf_thresh=0.25,
+    match_iou=0.5,
+    nms_iou=0.6,
+    max_batches=None,
+):
     model.eval()
-    all_preds   = []
+    all_preds = []
     all_targets = []
 
     print("Running inference...")
     for batch_idx, (images, targets, _) in enumerate(loader):
-        images = images.to(device)
-        prompts, zones, metrics = collate_targets_eval(targets, device)
+        if max_batches is not None and batch_idx >= max_batches:
+            break
 
+        images = images.to(device)
+        prompts, zones, metrics = build_batch_context(targets, device)
         outputs = model(images, prompts, zones, metrics)
 
-        scores    = outputs['scores']      # [B, Q, C]
-        boxes     = outputs['pred_boxes']  # [B, Q, 4]
+        scores = outputs['scores']
+        boxes = outputs['pred_boxes']
 
         for i in range(images.shape[0]):
-            # Filter by confidence
-            max_scores = scores[i].max(dim=-1).values
-            keep       = max_scores >= conf_thresh
-
-            all_preds.append({
-                'boxes':  boxes[i][keep].cpu(),
-                'scores': scores[i][keep].cpu(),
-            })
-
+            all_preds.append(
+                prepare_image_predictions(
+                    scores[i],
+                    boxes[i],
+                    conf_thresh=conf_thresh,
+                    nms_iou=nms_iou,
+                )
+            )
             all_targets.append({
-                'boxes':  targets[i]['boxes'],
+                'boxes': targets[i]['boxes'],
                 'labels': targets[i]['labels'],
             })
 
         if (batch_idx + 1) % 50 == 0:
-            print(f"  [{batch_idx+1}/{len(loader)}]")
+            print(f"  [{batch_idx + 1}/{len(loader)}]")
 
-    # Compute AP at IoU=0.5
     print("\nComputing mAP50...")
-    ap50 = evaluate_predictions(
-        all_preds, all_targets,
-        num_classes=6, iou_threshold=0.5
+    ap50_metrics = evaluate_predictions(
+        all_preds,
+        all_targets,
+        num_classes=6,
+        iou_threshold=0.5,
     )
 
-    # Compute mAP50-95
+    print(f"Computing precision/recall at IoU={match_iou:.2f}...")
+    pr_metrics = evaluate_predictions(
+        all_preds,
+        all_targets,
+        num_classes=6,
+        iou_threshold=match_iou,
+    )
+
     print("Computing mAP50-95...")
     ap_all = defaultdict(list)
     for iou_t in np.arange(0.5, 1.0, 0.05):
-        aps = evaluate_predictions(
-            all_preds, all_targets,
-            num_classes=6, iou_threshold=iou_t
+        threshold_metrics = evaluate_predictions(
+            all_preds,
+            all_targets,
+            num_classes=6,
+            iou_threshold=float(iou_t),
         )
-        for cls_id, ap in aps.items():
-            ap_all[cls_id].append(ap)
+        for cls_id, metrics in threshold_metrics.items():
+            ap_all[cls_id].append(metrics['ap'])
 
-    ap5095 = {cls_id: np.mean(vals) for cls_id, vals in ap_all.items()}
+    ap50 = {cls_id: metrics['ap'] for cls_id, metrics in ap50_metrics.items()}
+    ap5095 = {cls_id: float(np.mean(vals)) for cls_id, vals in ap_all.items()}
+    summary = summarize_metrics(pr_metrics)
+    return ap50, ap5095, pr_metrics, summary
 
-    return ap50, ap5095
 
+def print_results(ap50, ap5095, pr_metrics, summary, match_iou):
+    print("\n" + "=" * 90)
+    print(
+        f"{'Class':<20} {'AP50':>8} {'AP50-95':>10} "
+        f"{'Prec':>8} {'Recall':>8} {'F1':>8}"
+    )
+    print("-" * 90)
 
-def print_results(ap50, ap5095):
-    print("\n" + "=" * 60)
-    print(f"{'Class':<20} {'AP50':>10} {'AP50-95':>10}")
-    print("-" * 60)
-
-    map50   = []
+    map50 = []
     map5095 = []
 
     for cls_id in range(6):
         name = CLASS_ID_TO_NAME.get(cls_id, str(cls_id))
-        a50  = ap50.get(cls_id, 0.0)
-        a95  = ap5095.get(cls_id, 0.0)
+        a50 = ap50.get(cls_id, 0.0)
+        a95 = ap5095.get(cls_id, 0.0)
+        pr = pr_metrics.get(cls_id, {})
         map50.append(a50)
         map5095.append(a95)
-        print(f"  {name:<18} {a50:>10.3f} {a95:>10.3f}")
+        print(
+            f"  {name:<18} {a50:>8.3f} {a95:>10.3f} "
+            f"{pr.get('precision', 0.0):>8.3f} "
+            f"{pr.get('recall', 0.0):>8.3f} "
+            f"{pr.get('f1', 0.0):>8.3f}"
+        )
 
-    print("-" * 60)
-    print(f"  {'mAP (all)':<18} {np.mean(map50):>10.3f} {np.mean(map5095):>10.3f}")
-    print("=" * 60)
+    print("-" * 90)
+    print(
+        f"  {'mAP (macro)':<18} {np.mean(map50):>8.3f} {np.mean(map5095):>10.3f} "
+        f"{summary['macro_precision']:>8.3f} "
+        f"{summary['macro_recall']:>8.3f} "
+        f"{summary['macro_f1']:>8.3f}"
+    )
+    print(
+        f"  {'Micro @ IoU':<18} {'-':>8} {'-':>10} "
+        f"{summary['micro_precision']:>8.3f} "
+        f"{summary['micro_recall']:>8.3f} "
+        f"{summary['micro_f1']:>8.3f}"
+    )
+    print("-" * 90)
+    print(
+        f"  Match IoU={match_iou:.2f} | "
+        f"TP={summary['total_tp']} FP={summary['total_fp']} FN={summary['total_fn']}"
+    )
+    print("=" * 90)
 
 
 def main():
-    args   = parse_args()
+    args = resolve_args(parse_args())
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = None
+    if args.checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        args = apply_checkpoint_model_config(args, checkpoint)
+
     print(f"Device : {device}")
     print(f"Split  : {args.split}")
     print(f"Mode   : {args.prompt_mode}")
+    print(f"Image only : {args.image_only}")
+    print(f"Data   : {args.json_path}")
+    print(f"Hidden dim : {args.hidden_dim}")
+    print(f"Conf   : {args.conf}")
+    print(f"Match IoU : {args.iou_thresh}")
+    print(f"NMS IoU   : {args.nms_iou}")
 
-    # ── Build model ───────────────────────────────────────────
     print("\nBuilding SLIM-Det...")
     model = SLIMDet(
-        num_classes = 6,
-        hidden_dim  = 256,
-        num_queries = 90,
-        num_layers  = 4,
-        text_model  = 'minilm',
-        freeze_text = True,
-        use_scf     = True,
+        num_classes=6,
+        hidden_dim=args.hidden_dim,
+        num_queries=args.num_queries,
+        num_layers=args.num_layers,
+        text_model=args.text_model,
+        backbone_name=args.backbone_name,
+        prompt_mode=args.prompt_mode,
+        freeze_text=args.freeze_text,
+        pretrained_backbone=args.pretrained_backbone,
+        image_only=args.image_only,
+        use_scf=args.use_scf,
     ).to(device)
 
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        model.load_state_dict(ckpt['model'])
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint['model'])
         print(f"Loaded checkpoint: {args.checkpoint}")
     else:
-        print("No checkpoint — evaluating with random weights (sanity check only)")
-
-    # ── Data loader ───────────────────────────────────────────
-    json_path  = TEST_JSON  if args.split == 'test' else VAL_JSON
-    images_dir = TEST_IMAGES if args.split == 'test' else VAL_IMAGES
+        print("No checkpoint specified - evaluating random weights only")
 
     loader = build_val_loader(
-        json_path   = json_path,
-        images_dir  = images_dir,
-        batch_size  = args.batch,
-        image_size  = args.imgsz,
-        prompt_mode = args.prompt_mode,
-        num_workers = args.workers,
+        json_path=args.json_path,
+        images_dir=args.images_dir,
+        batch_size=args.batch,
+        image_size=args.imgsz,
+        prompt_mode=args.prompt_mode,
+        num_workers=args.workers,
     )
     print(f"Eval batches : {len(loader)}")
 
-    # ── Evaluate ──────────────────────────────────────────────
-    ap50, ap5095 = run_evaluation(
-        model, loader, device,
-        conf_thresh = args.conf,
-        iou_thresh  = args.iou_thresh,
+    ap50, ap5095, pr_metrics, summary = run_evaluation(
+        model,
+        loader,
+        device,
+        conf_thresh=args.conf,
+        match_iou=args.iou_thresh,
+        nms_iou=args.nms_iou,
+        max_batches=args.max_batches,
     )
-
-    print_results(ap50, ap5095)
+    print_results(ap50, ap5095, pr_metrics, summary, match_iou=args.iou_thresh)
 
 
 if __name__ == '__main__':

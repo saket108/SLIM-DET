@@ -8,10 +8,11 @@ import os
 import time
 import torch
 import torch.nn as nn
+from torch import amp
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
 
+from data.loader import build_batch_context
 from utils.metrics import LossTracker, MetricLogger
 
 
@@ -66,7 +67,10 @@ class Trainer:
             eta_min = config.get('lr', 4e-4) * 0.01,
         )
 
-        self.scaler = GradScaler(enabled=(self.device.type == 'cuda'))
+        self.scaler = amp.GradScaler(
+            self.device.type,
+            enabled=(self.device.type == 'cuda'),
+        )
         self.logger = MetricLogger()
 
         self.best_val = float('inf')
@@ -74,17 +78,7 @@ class Trainer:
 
     def _collate_targets(self, targets):
         """Extract prompts, zones, metrics from batch targets."""
-        prompts, zones, metrics = [], [], []
-        for t in targets:
-            if t['num_anns'] > 0:
-                prompts.append(t['prompts'][0])
-                zones.append(t['zones'][0])
-                metrics.append(t['metrics'][0])
-            else:
-                prompts.append("No damage detected.")
-                zones.append('unknown')
-                metrics.append(torch.zeros(4))
-        return prompts, zones, torch.stack(metrics).to(self.device)
+        return build_batch_context(targets, self.device)
 
     def train_epoch(self, epoch):
         self.model.train()
@@ -97,9 +91,14 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            with autocast(enabled=(self.device.type == 'cuda')):
+            with amp.autocast(
+                device_type=self.device.type,
+                enabled=(self.device.type == 'cuda'),
+            ):
                 outputs = self.model(images, prompts, zones, metrics)
-                loss, loss_dict = self.loss_fn(outputs, targets, self.device)
+                loss, loss_dict = self.loss_fn(
+                    outputs, targets, self.device, epoch=epoch
+                )
 
             if self.device.type == 'cuda':
                 self.scaler.scale(loss).backward()
@@ -124,7 +123,7 @@ class Trainer:
         return tracker.summary()
 
     @torch.no_grad()
-    def val_epoch(self):
+    def val_epoch(self, epoch):
         self.model.eval()
         tracker = LossTracker()
 
@@ -132,7 +131,9 @@ class Trainer:
             images = images.to(self.device)
             prompts, zones, metrics = self._collate_targets(targets)
             outputs = self.model(images, prompts, zones, metrics)
-            loss, loss_dict = self.loss_fn(outputs, targets, self.device)
+            loss, loss_dict = self.loss_fn(
+                outputs, targets, self.device, epoch=epoch
+            )
             tracker.update({**loss_dict, 'total': loss.item()})
 
         return tracker.summary()
@@ -165,7 +166,7 @@ class Trainer:
             t0 = time.time()
 
             train_stats = self.train_epoch(epoch)
-            val_stats   = self.val_epoch()
+            val_stats   = self.val_epoch(epoch)
             self.scheduler.step()
 
             val_loss = val_stats.get('total', 0.0)

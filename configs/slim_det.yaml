@@ -8,6 +8,9 @@ model:
   num_queries:  90          # must be divisible by 3 (30 per group)
   num_layers:   4           # RWDA decoder iterations
   text_model:   minilm      # sentence-transformers/all-MiniLM-L6-v2
+  backbone_name: convnextv2_tiny.fcmae_ft_in22k_in1k
+  pretrained_backbone: true
+  image_only:   false
   freeze_text:  true        # freeze text encoder weights
   use_scf:      true        # severity-conditioned filter
 
@@ -100,12 +103,16 @@ augmentation:
 eval:
   conf_thresh:  0.25
   iou_thresh:   0.5
+  nms_iou:      0.6
   batch_size:   16
+  during_train_every_epochs: 1
+  during_train_max_batches:
 
 # ── Checkpointing ─────────────────────────────────────────────
 checkpoint:
   save_dir:     runs/slim_det
   save_period:  50           # save every N epochs
+  save_period_batches: 0     # if >0, overwrite slim_det_last.pt mid-epoch
   patience:     50           # early stopping patience
 
 # ── Ablation experiment names ─────────────────────────────────
@@ -117,4 +124,6 @@ ablations:
   - name: slim_det_minimal
     prompt_mode: minimal
   - name: slim_det_cat_only
+    prompt_mode: cat_only
+  - name: slim_det_image_only
     prompt_mode: cat_only

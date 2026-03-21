@@ -141,18 +141,22 @@ def compute_confusion_matrix(all_preds, all_targets, num_classes, conf=0.25, iou
 
     for preds, targets in zip(all_preds, all_targets):
         pred_boxes   = preds['boxes']
-        pred_scores  = preds['scores']
         gt_boxes     = targets['boxes']
         gt_labels    = targets['labels']
 
         if len(pred_boxes) == 0 or len(gt_boxes) == 0:
             continue
 
-        # Get predicted class for each detection
-        pred_conf, pred_cls = pred_scores.max(dim=-1)
+        if 'labels' in preds and 'confidences' in preds:
+            pred_conf = preds['confidences']
+            pred_cls = preds['labels']
+        else:
+            pred_scores = preds['scores']
+            pred_conf, pred_cls = pred_scores.max(dim=-1)
+
         keep = pred_conf >= conf
-        pred_boxes  = pred_boxes[keep]
-        pred_cls    = pred_cls[keep]
+        pred_boxes = pred_boxes[keep]
+        pred_cls = pred_cls[keep]
 
         if len(pred_boxes) == 0:
             continue

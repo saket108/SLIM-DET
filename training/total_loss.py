@@ -1,4 +1,3 @@
-# training/total_loss.py  — FIXED VERSION
 """
 Total loss with:
 - Per-class focal loss (handles imbalance)
@@ -95,7 +94,6 @@ class TotalLoss(nn.Module):
         total_box = torch.tensor(0., device=device)
         total_giu = torch.tensor(0., device=device)
         total_sev = torch.tensor(0., device=device)
-        n_pos = 0
 
         for b in range(B):
             gt_boxes   = targets[b]['boxes'].to(device)
@@ -113,7 +111,9 @@ class TotalLoss(nn.Module):
                 self.assigner(
                     pred_logits[b].detach(),
                     pred_boxes[b].detach(),
-                    gt_boxes, gt_labels, gt_sev
+                    gt_boxes,
+                    gt_labels,
+                    gt_sev,
                 )
 
             # Classification loss
@@ -133,7 +133,6 @@ class TotalLoss(nn.Module):
                 ps = pred_severity[b][pos_mask].sigmoid()
                 ts = assigned_sev[pos_mask]
                 total_sev = total_sev + F.mse_loss(ps, ts)
-                n_pos += pos_mask.sum().item()
 
         norm = max(B, 1)
         return (
@@ -161,11 +160,12 @@ class TotalLoss(nn.Module):
         )
 
         # Aux losses — ramp weight from 0.1 to 1.0 over 50 epochs
-        aux_w = self.w_aux * min(1.0, 0.1 + epoch / 50.0)
+        progress = min(max(epoch - 1, 0), 49) / 49 if 49 > 0 else 1.0
+        aux_w = self.w_aux * (0.1 + 0.9 * progress)
         aux_loss = torch.tensor(0., device=device)
 
         for aux in aux_outputs:
-            al, _, _ = self.compute_layer_loss(
+            al, _ = self.compute_layer_loss(
                 aux['pred_logits'], aux['pred_boxes'],
                 aux['pred_severity'], targets, device
             )

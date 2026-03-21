@@ -7,19 +7,26 @@ Returns image + all structured annotation fields ready for SLIM-Det.
 
 import os
 import json
-import random
+from collections import Counter
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import torchvision.transforms.functional as TF
 
-from data.prompt_builder import build_batch_prompts, CLASS_NAME_TO_ID
+from data.prompt_builder import (
+    CLASS_NAME_TO_ID,
+    build_batch_prompts,
+    get_image_level_prompt,
+)
 
 
 # ── Default image transforms ──────────────────────────────────
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
+DEFAULT_IMAGE_PROMPT = "No damage detected in this inspection image."
+DEFAULT_IMAGE_ZONE = "unknown"
+DEFAULT_IMAGE_METRICS = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32)
 
 
 def make_transforms(image_size: int = 640, is_train: bool = True):
@@ -87,7 +94,6 @@ class AircraftDataset(Dataset):
 
     def _print_class_stats(self):
         """Print class distribution for verification."""
-        from collections import Counter
         counts = Counter()
         for item in self.images:
             for ann in item.get('annotations', []):
@@ -112,7 +118,7 @@ class AircraftDataset(Dataset):
 
         # ── Background image (no annotations) ─────────────────
         if not anns:
-            return image, self._empty_target(), image_id
+            return image, self._empty_target(image_id), image_id
 
         # ── Parse annotations ──────────────────────────────────
         boxes       = []   # [N, 4] normalized cx cy w h
@@ -156,6 +162,12 @@ class AircraftDataset(Dataset):
 
         # Build text prompts
         prompts = build_batch_prompts(anns[:self.max_anns], mode=self.prompt_mode)
+        image_prompt = get_image_level_prompt(
+            anns[:self.max_anns],
+            mode=self.prompt_mode,
+        )
+        image_zone = _select_image_zone(zones, severities)
+        image_metrics = _aggregate_image_metrics(metrics)
 
         # ── Convert to tensors ─────────────────────────────────
         target = {
@@ -166,13 +178,16 @@ class AircraftDataset(Dataset):
             'sev_levels': torch.tensor(sev_levels, dtype=torch.long),
             'zones':      zones,      # list of strings
             'prompts':    prompts,    # list of strings
+            'image_prompt': image_prompt,
+            'image_zone':   image_zone,
+            'image_metrics': torch.tensor(image_metrics, dtype=torch.float32),
             'image_id':   image_id,
             'num_anns':   len(anns[:self.max_anns]),
         }
 
         return image, target, image_id
 
-    def _empty_target(self):
+    def _empty_target(self, image_id=''):
         """Return empty target for background images."""
         return {
             'boxes':      torch.zeros((0, 4),  dtype=torch.float32),
@@ -182,7 +197,10 @@ class AircraftDataset(Dataset):
             'sev_levels': torch.zeros((0,),    dtype=torch.long),
             'zones':      [],
             'prompts':    [],
-            'image_id':   '',
+            'image_prompt': DEFAULT_IMAGE_PROMPT,
+            'image_zone':   DEFAULT_IMAGE_ZONE,
+            'image_metrics': DEFAULT_IMAGE_METRICS.clone(),
+            'image_id':   image_id,
             'num_anns':   0,
         }
 
@@ -204,6 +222,59 @@ def collate_fn(batch):
 
     images = torch.stack(images, dim=0)   # [B, 3, H, W]
     return images, targets, image_ids
+
+
+def _select_image_zone(zones, severities):
+    if not zones:
+        return DEFAULT_IMAGE_ZONE
+    if severities:
+        best_idx = max(range(len(severities)), key=severities.__getitem__)
+        return zones[best_idx]
+    return Counter(zones).most_common(1)[0][0]
+
+
+def _aggregate_image_metrics(metrics):
+    if not metrics:
+        return DEFAULT_IMAGE_METRICS.tolist()
+    metrics_arr = np.asarray(metrics, dtype=np.float32)
+    summary = metrics_arr.mean(axis=0)
+    summary[3] = metrics_arr[:, 3].max()
+    return summary.tolist()
+
+
+def summarize_target_context(target):
+    """Return one prompt, one zone, and one metric vector for an image target."""
+    if target.get('num_anns', 0) == 0:
+        return (
+            DEFAULT_IMAGE_PROMPT,
+            DEFAULT_IMAGE_ZONE,
+            DEFAULT_IMAGE_METRICS.clone(),
+        )
+
+    prompt = target.get('image_prompt') or DEFAULT_IMAGE_PROMPT
+    zone = target.get('image_zone') or DEFAULT_IMAGE_ZONE
+
+    metrics = target.get('image_metrics')
+    if metrics is None or torch.as_tensor(metrics).numel() == 0:
+        metrics = _aggregate_image_metrics(target.get('metrics', []))
+
+    metrics_tensor = torch.as_tensor(metrics, dtype=torch.float32)
+    return prompt, zone, metrics_tensor
+
+
+def build_batch_context(targets, device):
+    """Vectorize image-level conditioning inputs for a batch of targets."""
+    prompts = []
+    zones = []
+    metrics = []
+
+    for target in targets:
+        prompt, zone, metric = summarize_target_context(target)
+        prompts.append(prompt)
+        zones.append(zone)
+        metrics.append(metric)
+
+    return prompts, zones, torch.stack(metrics).to(device)
 
 
 # ── Class-balanced sampler ────────────────────────────────────
@@ -269,6 +340,12 @@ def build_train_loader(
         is_train    = True,
     )
 
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No training images were found for json_path='{json_path}' "
+            f"and images_dir='{images_dir}'."
+        )
+
     sampler = ClassBalancedSampler(dataset) if balanced else None
 
     return DataLoader(
@@ -278,8 +355,8 @@ def build_train_loader(
         shuffle     = (sampler is None),
         num_workers = num_workers,
         collate_fn  = collate_fn,
-        pin_memory  = True,
-        drop_last   = True,
+        pin_memory  = torch.cuda.is_available(),
+        drop_last   = len(dataset) > batch_size,
     )
 
 
@@ -300,13 +377,19 @@ def build_val_loader(
         is_train    = False,
     )
 
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No validation images were found for json_path='{json_path}' "
+            f"and images_dir='{images_dir}'."
+        )
+
     return DataLoader(
         dataset,
         batch_size  = batch_size,
         shuffle     = False,
         num_workers = num_workers,
         collate_fn  = collate_fn,
-        pin_memory  = True,
+        pin_memory  = torch.cuda.is_available(),
     )
 
 
