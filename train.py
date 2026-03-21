@@ -247,14 +247,49 @@ def train_one_epoch(
             outputs = model(images, prompts, zones, metrics)
             loss, loss_dict = loss_fn(outputs, targets, device, epoch=epoch)
 
+        if not torch.isfinite(loss.detach()):
+            if progress is not None:
+                progress.write(
+                    f"  Skipping non-finite loss at epoch {epoch}, step {i + 1}/{n_batches}"
+                )
+            else:
+                print(f"  Skipping non-finite loss at epoch {epoch}, step {i + 1}/{n_batches}")
+            continue
+
         if device.type == 'cuda':
             scaler.scale(loss).backward()
+
+            has_grad = any(
+                p.grad is not None
+                for group in optimizer.param_groups
+                for p in group['params']
+            )
+            if not has_grad:
+                if progress is not None:
+                    progress.write(
+                        f"  Skipping no-grad batch at epoch {epoch}, step {i + 1}/{n_batches}"
+                    )
+                else:
+                    print(f"  Skipping no-grad batch at epoch {epoch}, step {i + 1}/{n_batches}")
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
+
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            has_grad = any(
+                p.grad is not None
+                for group in optimizer.param_groups
+                for p in group['params']
+            )
+            if not has_grad:
+                print(f"  Skipping no-grad batch at epoch {epoch}, step {i + 1}/{n_batches}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 

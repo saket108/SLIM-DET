@@ -173,12 +173,15 @@ class TotalLoss(nn.Module):
 
         total = main_loss + aux_w * aux_loss
 
-        # Sanity check
+        # Keep the returned loss connected to the graph so AMP does not
+        # choke on batches that produce invalid losses.
         if torch.isnan(total) or torch.isinf(total):
-            return torch.tensor(0., device=device, requires_grad=True), loss_dict
+            loss_dict['invalid'] = 1
+            return pred_logits.sum() * 0.0, loss_dict
 
         loss_dict['aux'] = aux_loss.item()
         loss_dict['aux_w'] = aux_w
+        loss_dict['invalid'] = 0
         return total, loss_dict
 
 
