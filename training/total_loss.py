@@ -23,7 +23,14 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, pred, target):
-        alpha  = self.alpha.to(pred.device)
+        alpha = self.alpha.to(pred.device, dtype=pred.dtype)
+        if alpha.numel() != pred.shape[-1]:
+            alpha = torch.full(
+                (pred.shape[-1],),
+                0.25,
+                device=pred.device,
+                dtype=pred.dtype,
+            )
         bce    = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         pt     = torch.exp(-bce)
         focal  = (1 - pt) ** self.gamma * bce

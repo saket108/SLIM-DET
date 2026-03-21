@@ -13,12 +13,13 @@ import numpy as np
 import torch
 
 from data.loader import build_batch_context, build_val_loader
-from data.prompt_builder import CLASS_ID_TO_NAME
 from model.slim_det import SLIMDet
 from utils.runtime import (
     coalesce,
     load_yaml_config,
+    normalize_class_names,
     require_existing_paths,
+    resolve_detection_paths,
     resolve_dataset_paths,
 )
 
@@ -36,16 +37,21 @@ def parse_args():
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--split', type=str, default='val', choices=['val', 'test'])
     parser.add_argument('--dataset_root', type=str, default=None)
+    parser.add_argument('--data_config', type=str, default=None)
+    parser.add_argument('--data_format', type=str, default=None, choices=['json', 'detection'])
     parser.add_argument('--val_json', type=str, default=None)
     parser.add_argument('--test_json', type=str, default=None)
     parser.add_argument('--val_images', type=str, default=None)
     parser.add_argument('--test_images', type=str, default=None)
+    parser.add_argument('--val_labels', type=str, default=None)
+    parser.add_argument('--test_labels', type=str, default=None)
     parser.add_argument('--prompt_mode', type=str, default=None)
     parser.add_argument('--batch', type=int, default=None)
     parser.add_argument('--imgsz', type=int, default=None)
     parser.add_argument('--hidden_dim', type=int, default=None)
     parser.add_argument('--num_queries', type=int, default=None)
     parser.add_argument('--num_layers', type=int, default=None)
+    parser.add_argument('--num_classes', type=int, default=None)
     parser.add_argument('--conf', type=float, default=None)
     parser.add_argument('--iou_thresh', type=float, default=None)
     parser.add_argument('--nms_iou', type=float, default=None)
@@ -56,6 +62,7 @@ def parse_args():
     parser.add_argument('--no_scf', action='store_true')
     parser.add_argument('--image_only', dest='image_only', action='store_true')
     parser.add_argument('--multimodal', dest='image_only', action='store_false')
+    parser.add_argument('--detection_only', action='store_true')
     parser.add_argument('--freeze_text', dest='freeze_text', action='store_true')
     parser.add_argument('--train_text', dest='freeze_text', action='store_false')
     parser.add_argument('--no_pretrained_backbone', action='store_true')
@@ -70,39 +77,76 @@ def resolve_args(args):
     prompt_cfg = config.get('prompt', {})
     train_cfg = config.get('train', {})
     eval_cfg = config.get('eval', {})
+    data_format = coalesce(args.data_format, data_cfg.get('format'), 'json')
+    detection_only = bool(args.detection_only or data_format == 'detection')
+    class_names = normalize_class_names(data_cfg.get('class_names'))
+    num_classes = coalesce(args.num_classes, data_cfg.get('num_classes'), len(class_names) if class_names else None, 6)
 
-    dataset_root = coalesce(args.dataset_root, data_cfg.get('dataset_root'))
-    _, val_json, val_images = resolve_dataset_paths(
-        dataset_root=dataset_root,
-        data_config=data_cfg,
-        split='val',
-        json_path=args.val_json,
-        images_dir=args.val_images,
-    )
-    dataset_root, test_json, test_images = resolve_dataset_paths(
-        dataset_root=dataset_root,
-        data_config=data_cfg,
-        split='test',
-        json_path=args.test_json,
-        images_dir=args.test_images,
+    json_path = None
+    labels_dir = None
+    dataset_root = args.dataset_root if data_format == 'detection' else coalesce(
+        args.dataset_root,
+        data_cfg.get('dataset_root'),
     )
 
-    split_json = test_json if args.split == 'test' else val_json
-    split_images = test_images if args.split == 'test' else val_images
+    if data_format == 'detection':
+        val_paths = resolve_detection_paths(
+            config_path=args.data_config,
+            dataset_root=dataset_root,
+            split='val',
+            images_dir=args.val_images,
+            labels_dir=args.val_labels,
+        )
+        test_paths = resolve_detection_paths(
+            config_path=args.data_config,
+            dataset_root=val_paths['dataset_root'],
+            split='test',
+            images_dir=args.test_images,
+            labels_dir=args.test_labels,
+        )
+        active_paths = test_paths if args.split == 'test' else val_paths
+        dataset_root = active_paths['dataset_root']
+        split_images = active_paths['images_dir']
+        labels_dir = active_paths['labels_dir']
+        class_names = coalesce(active_paths['class_names'], class_names)
+        num_classes = coalesce(active_paths['num_classes'], num_classes, 6)
+    else:
+        _, val_json, val_images = resolve_dataset_paths(
+            dataset_root=dataset_root,
+            data_config=data_cfg,
+            split='val',
+            json_path=args.val_json,
+            images_dir=args.val_images,
+        )
+        dataset_root, test_json, test_images = resolve_dataset_paths(
+            dataset_root=dataset_root,
+            data_config=data_cfg,
+            split='test',
+            json_path=args.test_json,
+            images_dir=args.test_images,
+        )
+        json_path = test_json if args.split == 'test' else val_json
+        split_images = test_images if args.split == 'test' else val_images
 
     resolved = {
         'config': args.config,
         'checkpoint': args.checkpoint,
         'split': args.split,
+        'data_config': args.data_config,
+        'data_format': data_format,
+        'detection_only': detection_only,
         'dataset_root': dataset_root,
-        'json_path': split_json,
+        'json_path': json_path,
         'images_dir': split_images,
-        'prompt_mode': coalesce(args.prompt_mode, prompt_cfg.get('mode'), 'full'),
+        'labels_dir': labels_dir,
+        'prompt_mode': coalesce(args.prompt_mode, 'cat_only' if detection_only else prompt_cfg.get('mode'), 'cat_only' if detection_only else 'full'),
         'batch': coalesce(args.batch, eval_cfg.get('batch_size'), train_cfg.get('batch_size'), 4),
         'imgsz': coalesce(args.imgsz, train_cfg.get('image_size'), data_cfg.get('image_size'), 640),
         'hidden_dim': coalesce(args.hidden_dim, model_cfg.get('hidden_dim'), 256),
-        'num_queries': coalesce(args.num_queries, model_cfg.get('num_queries'), 90),
-        'num_layers': coalesce(args.num_layers, model_cfg.get('num_layers'), 4),
+        'num_queries': coalesce(args.num_queries, model_cfg.get('detection_num_queries') if detection_only else model_cfg.get('num_queries'), 60 if detection_only else 90),
+        'num_layers': coalesce(args.num_layers, model_cfg.get('detection_num_layers') if detection_only else model_cfg.get('num_layers'), 2 if detection_only else 4),
+        'num_classes': num_classes,
+        'class_names': class_names,
         'conf': coalesce(args.conf, eval_cfg.get('conf_thresh'), 0.25),
         'iou_thresh': coalesce(args.iou_thresh, eval_cfg.get('iou_thresh'), 0.5),
         'nms_iou': coalesce(args.nms_iou, eval_cfg.get('nms_iou'), 0.6),
@@ -115,19 +159,26 @@ def resolve_args(args):
         'text_model': coalesce(args.text_model, model_cfg.get('text_model'), 'minilm'),
         'backbone_name': coalesce(
             args.backbone_name,
-            model_cfg.get('backbone_name'),
-            'convnextv2_tiny.fcmae_ft_in22k_in1k',
+            model_cfg.get('detection_backbone_name') if detection_only else model_cfg.get('backbone_name'),
+            'mobilenet' if detection_only else 'convnextv2_tiny.fcmae_ft_in22k_in1k',
         ),
-        'image_only': coalesce(args.image_only, model_cfg.get('image_only'), False),
+        'image_only': True if detection_only else coalesce(args.image_only, model_cfg.get('image_only'), False),
         'freeze_text': coalesce(args.freeze_text, model_cfg.get('freeze_text'), True),
-        'use_scf': not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True),
+        'use_scf': False if detection_only else (not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True)),
         'pretrained_backbone': (
             False if args.no_pretrained_backbone
             else coalesce(model_cfg.get('pretrained_backbone'), True)
         ),
     }
 
-    require_existing_paths(json_path=resolved['json_path'], images_dir=resolved['images_dir'])
+    if resolved['data_format'] == 'detection':
+        require_existing_paths(
+            data_config=resolved['data_config'],
+            images_dir=resolved['images_dir'],
+            labels_dir=resolved['labels_dir'],
+        )
+    else:
+        require_existing_paths(json_path=resolved['json_path'], images_dir=resolved['images_dir'])
     if resolved['checkpoint'] is not None:
         resolved['checkpoint'] = resolve_checkpoint_path(
             resolved['checkpoint'],
@@ -190,6 +241,10 @@ def apply_checkpoint_model_config(args, checkpoint):
         'pretrained_backbone',
         'image_only',
         'use_scf',
+        'num_classes',
+        'class_names',
+        'detection_only',
+        'data_format',
     ):
         if key in model_config:
             setattr(args, key, model_config[key])
@@ -425,6 +480,7 @@ def run_evaluation(
     model,
     loader,
     device,
+    num_classes,
     conf_thresh=0.25,
     match_iou=0.5,
     nms_iou=0.6,
@@ -467,7 +523,7 @@ def run_evaluation(
     ap50_metrics = evaluate_predictions(
         all_preds,
         all_targets,
-        num_classes=6,
+        num_classes=num_classes,
         iou_threshold=0.5,
     )
 
@@ -475,7 +531,7 @@ def run_evaluation(
     pr_metrics = evaluate_predictions(
         all_preds,
         all_targets,
-        num_classes=6,
+        num_classes=num_classes,
         iou_threshold=match_iou,
     )
 
@@ -485,7 +541,7 @@ def run_evaluation(
         threshold_metrics = evaluate_predictions(
             all_preds,
             all_targets,
-            num_classes=6,
+            num_classes=num_classes,
             iou_threshold=float(iou_t),
         )
         for cls_id, metrics in threshold_metrics.items():
@@ -497,7 +553,7 @@ def run_evaluation(
     return ap50, ap5095, pr_metrics, summary
 
 
-def print_results(ap50, ap5095, pr_metrics, summary, match_iou):
+def print_results(ap50, ap5095, pr_metrics, summary, match_iou, class_names=None):
     print("\n" + "=" * 90)
     print(
         f"{'Class':<20} {'AP50':>8} {'AP50-95':>10} "
@@ -508,8 +564,18 @@ def print_results(ap50, ap5095, pr_metrics, summary, match_iou):
     map50 = []
     map5095 = []
 
-    for cls_id in range(6):
-        name = CLASS_ID_TO_NAME.get(cls_id, str(cls_id))
+    num_classes = max(
+        len(class_names or []),
+        len(ap50),
+        len(ap5095),
+        len(pr_metrics),
+    )
+
+    for cls_id in range(num_classes):
+        if class_names and cls_id < len(class_names):
+            name = class_names[cls_id]
+        else:
+            name = str(cls_id)
         a50 = ap50.get(cls_id, 0.0)
         a95 = ap5095.get(cls_id, 0.0)
         pr = pr_metrics.get(cls_id, {})
@@ -553,17 +619,19 @@ def main():
 
     print(f"Device : {device}")
     print(f"Split  : {args.split}")
+    print(f"Format : {args.data_format}")
     print(f"Mode   : {args.prompt_mode}")
     print(f"Image only : {args.image_only}")
-    print(f"Data   : {args.json_path}")
+    print(f"Data   : {args.images_dir}")
     print(f"Hidden dim : {args.hidden_dim}")
+    print(f"Classes    : {args.num_classes}")
     print(f"Conf   : {args.conf}")
     print(f"Match IoU : {args.iou_thresh}")
     print(f"NMS IoU   : {args.nms_iou}")
 
     print("\nBuilding SLIM-Det...")
     model = SLIMDet(
-        num_classes=6,
+        num_classes=args.num_classes,
         hidden_dim=args.hidden_dim,
         num_queries=args.num_queries,
         num_layers=args.num_layers,
@@ -589,6 +657,9 @@ def main():
         image_size=args.imgsz,
         prompt_mode=args.prompt_mode,
         num_workers=args.workers,
+        data_format=args.data_format,
+        labels_dir=args.labels_dir,
+        class_names=args.class_names,
     )
     print(f"Eval batches : {len(loader)}")
 
@@ -596,12 +667,20 @@ def main():
         model,
         loader,
         device,
+        num_classes=args.num_classes,
         conf_thresh=args.conf,
         match_iou=args.iou_thresh,
         nms_iou=args.nms_iou,
         max_batches=args.max_batches,
     )
-    print_results(ap50, ap5095, pr_metrics, summary, match_iou=args.iou_thresh)
+    print_results(
+        ap50,
+        ap5095,
+        pr_metrics,
+        summary,
+        match_iou=args.iou_thresh,
+        class_names=args.class_names,
+    )
 
 
 if __name__ == '__main__':

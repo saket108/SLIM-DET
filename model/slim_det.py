@@ -27,6 +27,13 @@ from model.severity_head   import SeverityHead
 from model.scf             import SCF
 
 
+BACKBONE_ALIASES = {
+    'mobilenet': 'mobilenetv3_large_100',
+    'mobilenetv3': 'mobilenetv3_large_100',
+    'mobilenetv3_large': 'mobilenetv3_large_100',
+}
+
+
 # ── Pretrained backbone wrapper ───────────────────────────────
 class PretrainedBackbone(nn.Module):
     """
@@ -41,16 +48,23 @@ class PretrainedBackbone(nn.Module):
         pretrained: bool = True,
     ):
         super().__init__()
-        self.model_name = model_name
+        resolved_model_name = BACKBONE_ALIASES.get(model_name, model_name)
+        self.model_name = resolved_model_name
         self.using_timm = False
         self.apply_post_film = False
 
         in_channels = [64, 128, 256, 512]
-        if timm is not None:
+        if resolved_model_name in {'ghost_csp', 'ghostcsp'}:
+            print("  Using GhostCSPBackbone")
+            self.backbone = GhostCSPBackbone(
+                channels=in_channels,
+                hidden_dim=hidden_dim,
+            )
+        elif timm is not None:
             try:
-                print(f"  Loading backbone: {model_name} (pretrained={pretrained})")
+                print(f"  Loading backbone: {resolved_model_name} (pretrained={pretrained})")
                 self.backbone = timm.create_model(
-                    model_name,
+                    resolved_model_name,
                     pretrained=pretrained,
                     features_only=True,
                     out_indices=(0, 1, 2, 3),
@@ -63,7 +77,7 @@ class PretrainedBackbone(nn.Module):
                     try:
                         print(f"  Retrying backbone without pretrained weights: {exc}")
                         self.backbone = timm.create_model(
-                            model_name,
+                            resolved_model_name,
                             pretrained=False,
                             features_only=True,
                             out_indices=(0, 1, 2, 3),

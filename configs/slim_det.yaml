@@ -6,9 +6,12 @@ model:
   num_classes:  6
   hidden_dim:   256
   num_queries:  90          # must be divisible by 3 (30 per group)
+  detection_num_queries: 60
   num_layers:   4           # RWDA decoder iterations
+  detection_num_layers: 2
   text_model:   minilm      # sentence-transformers/all-MiniLM-L6-v2
   backbone_name: convnextv2_tiny.fcmae_ft_in22k_in1k
+  detection_backbone_name: mobilenet
   pretrained_backbone: true
   image_only:   false
   freeze_text:  true        # freeze text encoder weights
@@ -16,6 +19,7 @@ model:
 
 # ── Data ──────────────────────────────────────────────────────
 data:
+  format: json
   dataset_root: C:\Users\tsake\OneDrive\Desktop\Aircraft_dataset\content\Aircraft_dataset
   train_json:   Aircraft_train.json
   val_json:     Aircraft_val.json

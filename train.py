@@ -25,14 +25,15 @@ except ImportError:
     tqdm = None
 
 from data.loader import build_batch_context, build_train_loader, build_val_loader
-from evaluate import print_results as print_eval_results
 from evaluate import run_evaluation
 from model.slim_det import SLIMDet
 from training.total_loss import TotalLoss
 from utils.runtime import (
     coalesce,
     load_yaml_config,
+    normalize_class_names,
     require_existing_paths,
+    resolve_detection_paths,
     resolve_dataset_paths,
 )
 
@@ -48,10 +49,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train SLIM-Det')
     parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH)
     parser.add_argument('--dataset_root', type=str, default=None)
+    parser.add_argument('--data_config', type=str, default=None)
+    parser.add_argument('--data_format', type=str, default=None, choices=['json', 'detection'])
     parser.add_argument('--train_json', type=str, default=None)
     parser.add_argument('--val_json', type=str, default=None)
     parser.add_argument('--train_images', type=str, default=None)
     parser.add_argument('--val_images', type=str, default=None)
+    parser.add_argument('--train_labels', type=str, default=None)
+    parser.add_argument('--val_labels', type=str, default=None)
 
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--batch', type=int, default=None)
@@ -80,6 +85,7 @@ def parse_args():
     parser.add_argument('--no_scf', action='store_true')
     parser.add_argument('--image_only', dest='image_only', action='store_true')
     parser.add_argument('--multimodal', dest='image_only', action='store_false')
+    parser.add_argument('--detection_only', action='store_true')
     parser.add_argument('--freeze_text', dest='freeze_text', action='store_true')
     parser.add_argument('--train_text', dest='freeze_text', action='store_false')
     parser.add_argument('--save_every_batches', type=int, default=None)
@@ -102,36 +108,86 @@ def resolve_args(args):
     checkpoint_cfg = config.get('checkpoint', {})
     eval_cfg = config.get('eval', {})
 
-    dataset_root, train_json, train_images = resolve_dataset_paths(
-        dataset_root=args.dataset_root,
-        data_config=data_cfg,
-        split='train',
-        json_path=args.train_json,
-        images_dir=args.train_images,
-    )
-    _, val_json, val_images = resolve_dataset_paths(
-        dataset_root=dataset_root,
-        data_config=data_cfg,
-        split='val',
-        json_path=args.val_json,
-        images_dir=args.val_images,
-    )
+    data_format = coalesce(args.data_format, data_cfg.get('format'), 'json')
+    detection_only = bool(args.detection_only or data_format == 'detection')
+
+    train_json = None
+    val_json = None
+    train_labels = None
+    val_labels = None
+    class_names = normalize_class_names(data_cfg.get('class_names'))
+    num_classes = coalesce(data_cfg.get('num_classes'), len(class_names) if class_names else None, 6)
+
+    if data_format == 'detection':
+        train_paths = resolve_detection_paths(
+            config_path=args.data_config,
+            dataset_root=args.dataset_root,
+            split='train',
+            images_dir=args.train_images,
+            labels_dir=args.train_labels,
+        )
+        val_paths = resolve_detection_paths(
+            config_path=args.data_config,
+            dataset_root=train_paths['dataset_root'],
+            split='val',
+            images_dir=args.val_images,
+            labels_dir=args.val_labels,
+        )
+        dataset_root = train_paths['dataset_root']
+        train_images = train_paths['images_dir']
+        val_images = val_paths['images_dir']
+        train_labels = train_paths['labels_dir']
+        val_labels = val_paths['labels_dir']
+        class_names = coalesce(train_paths['class_names'], class_names)
+        num_classes = coalesce(train_paths['num_classes'], num_classes, 6)
+    else:
+        dataset_root, train_json, train_images = resolve_dataset_paths(
+            dataset_root=args.dataset_root,
+            data_config=data_cfg,
+            split='train',
+            json_path=args.train_json,
+            images_dir=args.train_images,
+        )
+        _, val_json, val_images = resolve_dataset_paths(
+            dataset_root=dataset_root,
+            data_config=data_cfg,
+            split='val',
+            json_path=args.val_json,
+            images_dir=args.val_images,
+        )
 
     resolved = {
         'config': args.config,
+        'data_config': args.data_config,
+        'data_format': data_format,
+        'detection_only': detection_only,
         'dataset_root': dataset_root,
         'train_json': train_json,
         'val_json': val_json,
         'train_images': train_images,
         'val_images': val_images,
+        'train_labels': train_labels,
+        'val_labels': val_labels,
         'epochs': coalesce(args.epochs, train_cfg.get('epochs'), 300),
         'batch': coalesce(args.batch, train_cfg.get('batch_size'), 4),
         'lr': coalesce(args.lr, optimizer_cfg.get('lr'), 4e-4),
         'imgsz': coalesce(args.imgsz, train_cfg.get('image_size'), data_cfg.get('image_size'), 640),
         'hidden_dim': coalesce(args.hidden_dim, model_cfg.get('hidden_dim'), 256),
-        'num_queries': coalesce(args.num_queries, model_cfg.get('num_queries'), 90),
-        'num_layers': coalesce(args.num_layers, model_cfg.get('num_layers'), 4),
-        'prompt_mode': coalesce(args.prompt_mode, prompt_cfg.get('mode'), 'full'),
+        'num_queries': coalesce(
+            args.num_queries,
+            model_cfg.get('detection_num_queries') if detection_only else model_cfg.get('num_queries'),
+            60 if detection_only else 90,
+        ),
+        'num_layers': coalesce(
+            args.num_layers,
+            model_cfg.get('detection_num_layers') if detection_only else model_cfg.get('num_layers'),
+            2 if detection_only else 4,
+        ),
+        'prompt_mode': coalesce(
+            args.prompt_mode,
+            'cat_only' if detection_only else prompt_cfg.get('mode'),
+            'cat_only' if detection_only else 'full',
+        ),
         'workers': (
             args.workers
             if args.workers is not None
@@ -142,16 +198,18 @@ def resolve_args(args):
         'text_model': coalesce(args.text_model, model_cfg.get('text_model'), 'minilm'),
         'backbone_name': coalesce(
             args.backbone_name,
-            model_cfg.get('backbone_name'),
-            'convnextv2_tiny.fcmae_ft_in22k_in1k',
+            model_cfg.get('detection_backbone_name') if detection_only else model_cfg.get('backbone_name'),
+            'mobilenet' if detection_only else 'convnextv2_tiny.fcmae_ft_in22k_in1k',
         ),
-        'image_only': coalesce(args.image_only, model_cfg.get('image_only'), False),
+        'image_only': True if detection_only else coalesce(args.image_only, model_cfg.get('image_only'), False),
         'freeze_text': coalesce(args.freeze_text, model_cfg.get('freeze_text'), True),
-        'use_scf': not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True),
+        'use_scf': False if detection_only else (not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True)),
         'pretrained_backbone': (
             False if args.no_pretrained_backbone
             else coalesce(model_cfg.get('pretrained_backbone'), True)
         ),
+        'num_classes': num_classes,
+        'class_names': class_names,
         'save_every_batches': coalesce(
             args.save_every_batches,
             checkpoint_cfg.get('save_period_batches'),
@@ -160,7 +218,7 @@ def resolve_args(args):
         'eval_every_epochs': coalesce(
             args.eval_every_epochs,
             eval_cfg.get('during_train_every_epochs'),
-            1,
+            5 if detection_only else 1,
         ),
         'eval_max_batches': coalesce(
             args.eval_max_batches,
@@ -172,12 +230,21 @@ def resolve_args(args):
         'eval_nms_iou': coalesce(args.eval_nms_iou, eval_cfg.get('nms_iou'), 0.6),
     }
 
-    require_existing_paths(
-        train_json=resolved['train_json'],
-        val_json=resolved['val_json'],
-        train_images=resolved['train_images'],
-        val_images=resolved['val_images'],
-    )
+    if resolved['data_format'] == 'detection':
+        require_existing_paths(
+            data_config=resolved['data_config'],
+            train_images=resolved['train_images'],
+            val_images=resolved['val_images'],
+            train_labels=resolved['train_labels'],
+            val_labels=resolved['val_labels'],
+        )
+    else:
+        require_existing_paths(
+            train_json=resolved['train_json'],
+            val_json=resolved['val_json'],
+            train_images=resolved['train_images'],
+            val_images=resolved['val_images'],
+        )
     if resolved['resume'] is not None:
         require_existing_paths(resume=resolved['resume'])
     return argparse.Namespace(**resolved)
@@ -185,7 +252,7 @@ def resolve_args(args):
 
 def build_model_config(args):
     return {
-        'num_classes': 6,
+        'num_classes': args.num_classes,
         'hidden_dim': args.hidden_dim,
         'num_queries': args.num_queries,
         'num_layers': args.num_layers,
@@ -197,6 +264,16 @@ def build_model_config(args):
         'image_only': args.image_only,
         'use_scf': args.use_scf,
     }
+
+
+def build_checkpoint_model_config(args):
+    config = build_model_config(args)
+    config.update({
+        'class_names': args.class_names,
+        'detection_only': args.detection_only,
+        'data_format': args.data_format,
+    })
+    return config
 
 
 def append_csv_row(path, fieldnames, row):
@@ -409,19 +486,29 @@ def mean_metric(values):
     return float(sum(values) / len(values))
 
 
+def format_metric(value, digits=4):
+    if value == '' or value is None:
+        return 'n/a'
+    return f"{value:.{digits}f}"
+
+
 def main():
     args = resolve_args(parse_args())
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device       : {device}")
+    print(f"Data format  : {args.data_format}")
+    print(f"Detection    : {args.detection_only}")
     print(f"Prompt mode  : {args.prompt_mode}")
     print(f"Image only   : {args.image_only}")
     print(f"Epochs       : {args.epochs}")
     print(f"Hidden dim   : {args.hidden_dim}")
     print(f"Batch size   : {args.batch}")
+    print(f"Classes      : {args.num_classes}")
     print(f"Dataset root : {args.dataset_root}")
 
     print("\nBuilding SLIM-Det...")
     model_config = build_model_config(args)
+    checkpoint_model_config = build_checkpoint_model_config(args)
     model = SLIMDet(**model_config).to(device)
 
     pc = model.param_count()
@@ -436,7 +523,10 @@ def main():
         image_size=args.imgsz,
         prompt_mode=args.prompt_mode,
         num_workers=args.workers,
-        balanced=True,
+        balanced=(args.data_format == 'json'),
+        data_format=args.data_format,
+        labels_dir=args.train_labels,
+        class_names=args.class_names,
     )
     val_loader = build_val_loader(
         json_path=args.val_json,
@@ -445,11 +535,14 @@ def main():
         image_size=args.imgsz,
         prompt_mode=args.prompt_mode,
         num_workers=args.workers,
+        data_format=args.data_format,
+        labels_dir=args.val_labels,
+        class_names=args.class_names,
     )
     print(f"  Train batches : {len(train_loader)}")
     print(f"  Val batches   : {len(val_loader)}")
 
-    loss_fn = TotalLoss()
+    loss_fn = TotalLoss(w_sev=0.0 if args.detection_only else 0.5)
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
@@ -487,6 +580,10 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     global_step = 0
     history_path = os.path.join(args.save_dir, 'train_history.csv')
+    print(
+        f"{'Epoch':<10} {'Train':>10} {'Val':>10} "
+        f"{'Prec':>8} {'Recall':>8} {'mAP50':>10} {'mAP50-95':>10} {'Sec':>8}"
+    )
     history_fields = [
         'epoch',
         'train_loss',
@@ -518,7 +615,7 @@ def main():
                 best_val,
                 args.save_dir,
                 tag='last',
-                model_config=model_config,
+                model_config=checkpoint_model_config,
                 train_loss=train_loss,
                 batch_in_epoch=batch_in_epoch,
                 total_batches=total_batches,
@@ -552,6 +649,7 @@ def main():
                 model,
                 val_loader,
                 device,
+                num_classes=args.num_classes,
                 conf_thresh=args.eval_conf,
                 match_iou=args.eval_iou,
                 nms_iou=args.eval_nms_iou,
@@ -559,18 +657,18 @@ def main():
             )
             map50 = mean_metric(list(ap50.values()))
             map5095 = mean_metric(list(ap5095.values()))
-            print_eval_results(ap50, ap5095, pr_metrics, summary, args.eval_iou)
 
         scheduler.step()
 
         elapsed = time.time() - t0
+        macro_precision = None if summary is None else summary['macro_precision']
+        macro_recall = None if summary is None else summary['macro_recall']
         print(
-            f"Epoch {epoch:3d}/{args.epochs} | "
-            f"train={train_loss:.4f} | val={val_loss:.4f} | "
-            f"mAP50={map50 if map50 != '' else 'n/a'} | "
-            f"mAP50-95={map5095 if map5095 != '' else 'n/a'} | "
-            f"lr={scheduler.get_last_lr()[0]:.2e} | "
-            f"{elapsed:.0f}s"
+            f"{f'{epoch}/{args.epochs}':<10} "
+            f"{train_loss:>10.4f} {val_loss:>10.4f} "
+            f"{format_metric(macro_precision, 3):>8} {format_metric(macro_recall, 3):>8} "
+            f"{format_metric(map50, 3):>10} {format_metric(map5095, 3):>10} "
+            f"{elapsed:>8.0f}"
         )
         append_csv_row(
             history_path,
@@ -601,7 +699,7 @@ def main():
             val_loss,
             args.save_dir,
             tag='last',
-            model_config=model_config,
+            model_config=checkpoint_model_config,
             train_loss=train_loss,
             batch_in_epoch=len(train_loader),
             total_batches=len(train_loader),
@@ -619,7 +717,7 @@ def main():
                 val_loss,
                 args.save_dir,
                 tag='best',
-                model_config=model_config,
+                model_config=checkpoint_model_config,
                 train_loss=train_loss,
                 batch_in_epoch=len(train_loader),
                 total_batches=len(train_loader),
@@ -637,7 +735,7 @@ def main():
                 val_loss,
                 args.save_dir,
                 tag=f'ep{epoch}',
-                model_config=model_config,
+                model_config=checkpoint_model_config,
                 train_loss=train_loss,
                 batch_in_epoch=len(train_loader),
                 total_batches=len(train_loader),
