@@ -23,9 +23,16 @@ from utils.runtime import (
 )
 
 
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'configs',
+    'slim_det.yaml',
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate SLIM-Det')
-    parser.add_argument('--config', type=str, default='configs/slim_det.yaml')
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH)
     parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--split', type=str, default='val', choices=['val', 'test'])
     parser.add_argument('--dataset_root', type=str, default=None)

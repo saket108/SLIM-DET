@@ -4,7 +4,7 @@ SLIM-Det training script.
 Usage:
     python train.py
     python train.py --config configs/slim_det.yaml
-    python train.py --dataset_root C:\path\to\Aircraft_dataset
+    python train.py --dataset_root C:\\path\\to\\Aircraft_dataset
 """
 
 import argparse
@@ -37,9 +37,16 @@ from utils.runtime import (
 )
 
 
+DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'configs',
+    'slim_det.yaml',
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train SLIM-Det')
-    parser.add_argument('--config', type=str, default='configs/slim_det.yaml')
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH)
     parser.add_argument('--dataset_root', type=str, default=None)
     parser.add_argument('--train_json', type=str, default=None)
     parser.add_argument('--val_json', type=str, default=None)
