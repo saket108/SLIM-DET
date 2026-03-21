@@ -1,0 +1,120 @@
+# configs/slim_det.yaml
+# SLIM-Det training configuration
+
+# ── Model ─────────────────────────────────────────────────────
+model:
+  num_classes:  6
+  hidden_dim:   256
+  num_queries:  90          # must be divisible by 3 (30 per group)
+  num_layers:   4           # RWDA decoder iterations
+  text_model:   minilm      # sentence-transformers/all-MiniLM-L6-v2
+  freeze_text:  true        # freeze text encoder weights
+  use_scf:      true        # severity-conditioned filter
+
+# ── Data ──────────────────────────────────────────────────────
+data:
+  dataset_root: C:\Users\tsake\OneDrive\Desktop\Aircraft_dataset\content\Aircraft_dataset
+  train_json:   Aircraft_train.json
+  val_json:     Aircraft_val.json
+  test_json:    Aircraft_test.json
+  image_size:   640
+  num_classes:  6
+  class_names:
+    0: crack
+    1: dent
+    2: corrosion
+    3: scratch
+    4: missing-head
+    5: paint-peel-off
+
+# ── Prompt modes (ablation) ───────────────────────────────────
+prompt:
+  mode: full                # full | no_desc | minimal | cat_only
+  max_length: 128           # max token length for text encoder
+
+# ── Training ──────────────────────────────────────────────────
+train:
+  epochs:       300
+  batch_size:   16
+  num_workers:  4
+  image_size:   640
+  balanced_sampler: true    # oversample rare classes
+
+# ── Optimizer ─────────────────────────────────────────────────
+optimizer:
+  type:         adamw
+  lr:           4.0e-4
+  weight_decay: 5.0e-4
+  betas:        [0.9, 0.999]
+
+# ── Scheduler ─────────────────────────────────────────────────
+scheduler:
+  type:         cosine
+  warmup_epochs: 10
+  eta_min_ratio: 0.01       # final lr = lr * eta_min_ratio
+
+# ── Loss weights ──────────────────────────────────────────────
+loss:
+  focal_cls:    1.0
+  l1_box:       5.0
+  giou:         2.0
+  severity:     1.0
+  aux_weight:   1.0         # applied to each intermediate decoder layer
+
+# ── Task-aligned assigner ─────────────────────────────────────
+assigner:
+  topk:   13
+  alpha:  0.5
+  beta:   6.0
+
+# ── Class-weighted focal loss alpha ───────────────────────────
+# Inverse-frequency weights — rare classes get higher alpha
+focal_alpha:
+  crack:          0.18
+  dent:           0.12      # most common — lowest weight
+  corrosion:      0.48
+  scratch:        0.65      # rarest — highest weight
+  missing-head:   0.42
+  paint-peel-off: 0.58
+
+# ── Augmentation ──────────────────────────────────────────────
+augmentation:
+  copy_paste:     true
+  copy_paste_prob: 0.5
+  target_counts:              # oversample to these counts
+    scratch:       3500
+    paint-peel-off: 3500
+    corrosion:     3500
+    missing-head:  5000
+  mosaic:         true
+  mixup_prob:     0.15
+  degrees:        10.0
+  flipud:         0.5
+  fliplr:         0.5
+  hsv_h:          0.015
+  hsv_s:          0.7
+  hsv_v:          0.4
+  scale:          0.5
+
+# ── Evaluation ────────────────────────────────────────────────
+eval:
+  conf_thresh:  0.25
+  iou_thresh:   0.5
+  batch_size:   16
+
+# ── Checkpointing ─────────────────────────────────────────────
+checkpoint:
+  save_dir:     runs/slim_det
+  save_period:  50           # save every N epochs
+  patience:     50           # early stopping patience
+
+# ── Ablation experiment names ─────────────────────────────────
+ablations:
+  - name: slim_det_full
+    prompt_mode: full
+  - name: slim_det_no_desc
+    prompt_mode: no_desc
+  - name: slim_det_minimal
+    prompt_mode: minimal
+  - name: slim_det_cat_only
+    prompt_mode: cat_only

@@ -1,0 +1,8 @@
+__pycache__/ 
+*.pyc 
+runs/ 
+*.pt 
+*.pth 
+.env 
+*.cache 
+data/__pycache__/ 
