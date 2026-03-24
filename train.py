@@ -86,6 +86,9 @@ def parse_args():
     parser.add_argument('--image_only', dest='image_only', action='store_true')
     parser.add_argument('--multimodal', dest='image_only', action='store_false')
     parser.add_argument('--detection_only', action='store_true')
+    parser.add_argument('--quality_head', dest='use_quality_head', action='store_true')
+    parser.add_argument('--no_quality_head', dest='use_quality_head', action='store_false')
+    parser.add_argument('--quality_loss_weight', type=float, default=None)
     parser.add_argument('--freeze_text', dest='freeze_text', action='store_true')
     parser.add_argument('--train_text', dest='freeze_text', action='store_false')
     parser.add_argument('--save_every_batches', type=int, default=None)
@@ -94,7 +97,7 @@ def parse_args():
         action='store_true',
         help='Disable pretrained timm weights and use random-init/fallback backbone.',
     )
-    parser.set_defaults(freeze_text=None, image_only=None)
+    parser.set_defaults(freeze_text=None, image_only=None, use_quality_head=None)
     return parser.parse_args()
 
 
@@ -203,6 +206,11 @@ def resolve_args(args):
         ),
         'image_only': True if detection_only else coalesce(args.image_only, model_cfg.get('image_only'), False),
         'freeze_text': coalesce(args.freeze_text, model_cfg.get('freeze_text'), True),
+        'use_quality_head': coalesce(
+            args.use_quality_head,
+            model_cfg.get('use_quality_head'),
+            False,
+        ),
         'use_scf': False if detection_only else (not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True)),
         'pretrained_backbone': (
             False if args.no_pretrained_backbone
@@ -228,6 +236,7 @@ def resolve_args(args):
         'eval_conf': coalesce(args.eval_conf, eval_cfg.get('conf_thresh'), 0.25),
         'eval_iou': coalesce(args.eval_iou, eval_cfg.get('iou_thresh'), 0.5),
         'eval_nms_iou': coalesce(args.eval_nms_iou, eval_cfg.get('nms_iou'), 0.6),
+        'quality_loss_weight': coalesce(args.quality_loss_weight, config.get('loss', {}).get('quality'), 0.0),
     }
 
     if resolved['data_format'] == 'detection':
@@ -262,6 +271,7 @@ def build_model_config(args):
         'freeze_text': args.freeze_text,
         'pretrained_backbone': args.pretrained_backbone,
         'image_only': args.image_only,
+        'use_quality_head': args.use_quality_head,
         'use_scf': args.use_scf,
     }
 
@@ -274,6 +284,34 @@ def build_checkpoint_model_config(args):
         'data_format': args.data_format,
     })
     return config
+
+
+def apply_checkpoint_model_config(args, checkpoint):
+    model_config = checkpoint.get('model_config')
+    if not model_config:
+        return args
+
+    for key in (
+        'hidden_dim',
+        'num_queries',
+        'num_layers',
+        'text_model',
+        'backbone_name',
+        'prompt_mode',
+        'freeze_text',
+        'pretrained_backbone',
+        'image_only',
+        'use_quality_head',
+        'use_scf',
+        'num_classes',
+        'class_names',
+        'detection_only',
+        'data_format',
+    ):
+        if key in model_config:
+            setattr(args, key, model_config[key])
+
+    return args
 
 
 def append_csv_row(path, fieldnames, row):
@@ -307,9 +345,9 @@ def train_one_epoch(
         progress = tqdm(
             loader,
             total=n_batches,
-            desc=f"Epoch {epoch}/{total_epochs or '?'}",
+            desc=f"Train {epoch}/{total_epochs or '?'}",
             dynamic_ncols=True,
-            leave=False,
+            leave=True,
             disable=not sys.stdout.isatty(),
         )
         iterator = progress
@@ -379,7 +417,7 @@ def train_one_epoch(
                 'cls': f"{loss_dict.get('cls', 0):.3f}",
                 'box': f"{loss_dict.get('box', 0):.3f}",
                 'giou': f"{loss_dict.get('giou', 0):.3f}",
-                'sev': f"{loss_dict.get('sev', 0):.3f}",
+                'qual': f"{loss_dict.get('qual', 0):.3f}",
                 'lr': f"{optimizer.param_groups[0]['lr']:.2e}",
             })
         elif (i + 1) % 50 == 0 or i == 0:
@@ -389,6 +427,7 @@ def train_one_epoch(
                 f"cls={loss_dict.get('cls', 0):.3f} "
                 f"box={loss_dict.get('box', 0):.3f} "
                 f"giou={loss_dict.get('giou', 0):.3f} "
+                f"qual={loss_dict.get('qual', 0):.3f} "
                 f"sev={loss_dict.get('sev', 0):.3f}"
             )
 
@@ -425,7 +464,7 @@ def validate(model, loader, loss_fn, device, epoch):
             total=n_batches,
             desc=f"Val {epoch}",
             dynamic_ncols=True,
-            leave=False,
+            leave=True,
             disable=not sys.stdout.isatty(),
         )
         iterator = progress
@@ -494,12 +533,17 @@ def format_metric(value, digits=4):
 
 def main():
     args = resolve_args(parse_args())
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location='cpu')
+        args = apply_checkpoint_model_config(args, resume_ckpt)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device       : {device}")
     print(f"Data format  : {args.data_format}")
     print(f"Detection    : {args.detection_only}")
     print(f"Prompt mode  : {args.prompt_mode}")
     print(f"Image only   : {args.image_only}")
+    print(f"Quality head : {args.use_quality_head}")
     print(f"Epochs       : {args.epochs}")
     print(f"Hidden dim   : {args.hidden_dim}")
     print(f"Batch size   : {args.batch}")
@@ -542,7 +586,10 @@ def main():
     print(f"  Train batches : {len(train_loader)}")
     print(f"  Val batches   : {len(val_loader)}")
 
-    loss_fn = TotalLoss(w_sev=0.0 if args.detection_only else 0.5)
+    loss_fn = TotalLoss(
+        w_sev=0.0 if args.detection_only else 0.5,
+        w_quality=args.quality_loss_weight,
+    )
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
@@ -560,7 +607,7 @@ def main():
     best_val = float('inf')
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = resume_ckpt or torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
@@ -654,6 +701,8 @@ def main():
                 match_iou=args.eval_iou,
                 nms_iou=args.eval_nms_iou,
                 max_batches=args.eval_max_batches,
+                verbose=False,
+                progress_label=f"Eval {epoch}/{args.epochs}",
             )
             map50 = mean_metric(list(ap50.values()))
             map5095 = mean_metric(list(ap5095.values()))

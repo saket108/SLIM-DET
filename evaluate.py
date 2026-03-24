@@ -11,6 +11,10 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 from data.loader import build_batch_context, build_val_loader
 from model.slim_det import SLIMDet
@@ -63,10 +67,12 @@ def parse_args():
     parser.add_argument('--image_only', dest='image_only', action='store_true')
     parser.add_argument('--multimodal', dest='image_only', action='store_false')
     parser.add_argument('--detection_only', action='store_true')
+    parser.add_argument('--quality_head', dest='use_quality_head', action='store_true')
+    parser.add_argument('--no_quality_head', dest='use_quality_head', action='store_false')
     parser.add_argument('--freeze_text', dest='freeze_text', action='store_true')
     parser.add_argument('--train_text', dest='freeze_text', action='store_false')
     parser.add_argument('--no_pretrained_backbone', action='store_true')
-    parser.set_defaults(freeze_text=None, image_only=None)
+    parser.set_defaults(freeze_text=None, image_only=None, use_quality_head=None)
     return parser.parse_args()
 
 
@@ -164,6 +170,11 @@ def resolve_args(args):
         ),
         'image_only': True if detection_only else coalesce(args.image_only, model_cfg.get('image_only'), False),
         'freeze_text': coalesce(args.freeze_text, model_cfg.get('freeze_text'), True),
+        'use_quality_head': coalesce(
+            args.use_quality_head,
+            model_cfg.get('use_quality_head'),
+            False,
+        ),
         'use_scf': False if detection_only else (not args.no_scf if args.no_scf else coalesce(model_cfg.get('use_scf'), True)),
         'pretrained_backbone': (
             False if args.no_pretrained_backbone
@@ -240,6 +251,7 @@ def apply_checkpoint_model_config(args, checkpoint):
         'freeze_text',
         'pretrained_backbone',
         'image_only',
+        'use_quality_head',
         'use_scf',
         'num_classes',
         'class_names',
@@ -485,13 +497,33 @@ def run_evaluation(
     match_iou=0.5,
     nms_iou=0.6,
     max_batches=None,
+    verbose=True,
+    progress_label=None,
 ):
     model.eval()
     all_preds = []
     all_targets = []
 
-    print("Running inference...")
-    for batch_idx, (images, targets, _) in enumerate(loader):
+    iterator = loader
+    progress = None
+    total_batches = min(len(loader), max_batches) if max_batches is not None else len(loader)
+    if tqdm is not None:
+        progress = tqdm(
+            loader,
+            total=total_batches,
+            desc=progress_label or "Eval",
+            dynamic_ncols=True,
+            leave=False,
+            disable=(not verbose),
+        )
+        iterator = progress
+    elif verbose:
+        print("Running inference...")
+
+    if verbose and progress is None:
+        print("Running inference...")
+
+    for batch_idx, (images, targets, _) in enumerate(iterator):
         if max_batches is not None and batch_idx >= max_batches:
             break
 
@@ -516,10 +548,16 @@ def run_evaluation(
                 'labels': targets[i]['labels'],
             })
 
-        if (batch_idx + 1) % 50 == 0:
+        if progress is not None:
+            progress.set_postfix({'images': len(all_targets)})
+        elif verbose and (batch_idx + 1) % 50 == 0:
             print(f"  [{batch_idx + 1}/{len(loader)}]")
 
-    print("\nComputing mAP50...")
+    if progress is not None:
+        progress.close()
+
+    if verbose:
+        print("\nComputing mAP50...")
     ap50_metrics = evaluate_predictions(
         all_preds,
         all_targets,
@@ -527,7 +565,8 @@ def run_evaluation(
         iou_threshold=0.5,
     )
 
-    print(f"Computing precision/recall at IoU={match_iou:.2f}...")
+    if verbose:
+        print(f"Computing precision/recall at IoU={match_iou:.2f}...")
     pr_metrics = evaluate_predictions(
         all_preds,
         all_targets,
@@ -535,7 +574,8 @@ def run_evaluation(
         iou_threshold=match_iou,
     )
 
-    print("Computing mAP50-95...")
+    if verbose:
+        print("Computing mAP50-95...")
     ap_all = defaultdict(list)
     for iou_t in np.arange(0.5, 1.0, 0.05):
         threshold_metrics = evaluate_predictions(
@@ -622,6 +662,7 @@ def main():
     print(f"Format : {args.data_format}")
     print(f"Mode   : {args.prompt_mode}")
     print(f"Image only : {args.image_only}")
+    print(f"Quality head : {args.use_quality_head}")
     print(f"Data   : {args.images_dir}")
     print(f"Hidden dim : {args.hidden_dim}")
     print(f"Classes    : {args.num_classes}")
@@ -641,6 +682,7 @@ def main():
         freeze_text=args.freeze_text,
         pretrained_backbone=args.pretrained_backbone,
         image_only=args.image_only,
+        use_quality_head=args.use_quality_head,
         use_scf=args.use_scf,
     ).to(device)
 

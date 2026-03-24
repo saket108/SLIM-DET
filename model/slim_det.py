@@ -158,6 +158,7 @@ class SLIMDet(nn.Module):
         text_local_files_only: bool = False,
         pretrained_backbone: bool = True,
         image_only:    bool = False,
+        use_quality_head: bool = False,
         use_scf:       bool = True,
     ):
         super().__init__()
@@ -165,6 +166,7 @@ class SLIMDet(nn.Module):
         self.hidden_dim  = hidden_dim
         self.num_queries = num_queries
         self.image_only  = image_only
+        self.use_quality_head = use_quality_head
         self.use_scf     = use_scf
 
         # ── Encoders / image-only baseline branch ─────────────
@@ -213,7 +215,11 @@ class SLIMDet(nn.Module):
         )
 
         # ── Heads ──────────────────────────────────────────────
-        self.detect_head   = DetectorHead(hidden_dim=hidden_dim, num_classes=num_classes)
+        self.detect_head   = DetectorHead(
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            use_quality_head=use_quality_head,
+        )
         self.severity_head = SeverityHead(hidden_dim=hidden_dim)
         if use_scf:
             self.scf = SCF(num_classes=num_classes, hidden_dim=hidden_dim)
@@ -249,23 +255,32 @@ class SLIMDet(nn.Module):
         queries, aux_list = self.decoder(queries, vis_mem, ctx_tokens)
 
         # 5. Predict
-        logits, boxes = self.detect_head(queries)
+        logits, boxes, quality = self.detect_head(queries)
         severity      = self.severity_head(queries)
-        scores        = self.scf(logits, severity, boxes)['scores'] \
-                        if self.use_scf else logits.sigmoid()
+        if self.use_scf:
+            scores = self.scf(logits, severity, boxes)['scores']
+        elif quality is not None:
+            quality_scores = quality.sigmoid().unsqueeze(-1)
+            scores = (logits.sigmoid() * quality_scores).sqrt()
+        else:
+            scores = logits.sigmoid()
 
         aux_outputs = []
         for aq in aux_list:
-            al, ab = self.detect_head(aq)
+            al, ab, aq_quality = self.detect_head(aq)
             asev   = self.severity_head(aq)
             aux_outputs.append({
-                'pred_logits': al, 'pred_boxes': ab, 'pred_severity': asev
+                'pred_logits': al,
+                'pred_boxes': ab,
+                'pred_severity': asev,
+                'pred_quality': aq_quality,
             })
 
         return {
             'pred_logits':   logits,
             'pred_boxes':    boxes,
             'pred_severity': severity,
+            'pred_quality':  quality,
             'scores':        scores,
             'aux_outputs':   aux_outputs,
         }
@@ -277,7 +292,7 @@ class SLIMDet(nn.Module):
 
 
 if __name__ == '__main__':
-    model = SLIMDet(num_classes=6, hidden_dim=256, num_queries=90)
+    model = SLIMDet(num_classes=6, hidden_dim=256, num_queries=90, use_quality_head=True)
     model.eval()
     B = 2
     images  = torch.randn(B, 3, 640, 640)
@@ -288,6 +303,7 @@ if __name__ == '__main__':
         out = model(images, prompts, zones, metrics)
     print(f"pred_logits  : {out['pred_logits'].shape}")
     print(f"pred_boxes   : {out['pred_boxes'].shape}")
+    print(f"pred_quality : {out['pred_quality'].shape if out['pred_quality'] is not None else None}")
     print(f"aux_outputs  : {len(out['aux_outputs'])}")
     pc = model.param_count()
     print(f"total params : {pc['total']:,}")

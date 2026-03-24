@@ -10,6 +10,7 @@ Total loss with:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from training.quality_loss import quality_bce_loss
 from training.task_aligned_assigner import TaskAlignedAssigner
 
 
@@ -81,6 +82,7 @@ class TotalLoss(nn.Module):
         w_box:  float = 5.0,
         w_giou: float = 2.0,
         w_sev:  float = 0.5,
+        w_quality: float = 0.0,
         w_aux:  float = 1.0,
     ):
         super().__init__()
@@ -88,12 +90,14 @@ class TotalLoss(nn.Module):
         self.w_box  = w_box
         self.w_giou = w_giou
         self.w_sev  = w_sev
+        self.w_quality = w_quality
         self.w_aux  = w_aux
 
         self.focal_loss = FocalLoss()
         self.assigner   = TaskAlignedAssigner(topk=13, alpha=0.5, beta=6.0)
 
     def compute_layer_loss(self, pred_logits, pred_boxes, pred_severity,
+                           pred_quality,
                            targets, device):
         """Compute loss for one decoder layer output."""
         B, Q, C = pred_logits.shape
@@ -101,6 +105,7 @@ class TotalLoss(nn.Module):
         total_box = torch.tensor(0., device=device)
         total_giu = torch.tensor(0., device=device)
         total_sev = torch.tensor(0., device=device)
+        total_quality = torch.tensor(0., device=device)
 
         for b in range(B):
             gt_boxes   = targets[b]['boxes'].to(device)
@@ -141,17 +146,23 @@ class TotalLoss(nn.Module):
                 ts = assigned_sev[pos_mask]
                 total_sev = total_sev + F.mse_loss(ps, ts)
 
+                if pred_quality is not None:
+                    pq = pred_quality[b][pos_mask]
+                    total_quality = total_quality + quality_bce_loss(pq, pb.detach(), tb.detach())
+
         norm = max(B, 1)
         return (
             self.w_cls  * total_cls / norm +
             self.w_box  * total_box / norm +
             self.w_giou * total_giu / norm +
-            self.w_sev  * total_sev / norm,
+            self.w_sev  * total_sev / norm +
+            self.w_quality * total_quality / norm,
             {
                 'cls':  (total_cls / norm).item(),
                 'box':  (total_box / norm).item(),
                 'giou': (total_giu / norm).item(),
                 'sev':  (total_sev / norm).item(),
+                'qual': (total_quality / norm).item(),
             }
         )
 
@@ -159,11 +170,12 @@ class TotalLoss(nn.Module):
         pred_logits  = outputs['pred_logits']
         pred_boxes   = outputs['pred_boxes']
         pred_severity= outputs['pred_severity']
+        pred_quality = outputs.get('pred_quality')
         aux_outputs  = outputs.get('aux_outputs', [])
 
         # Main loss
         main_loss, loss_dict = self.compute_layer_loss(
-            pred_logits, pred_boxes, pred_severity, targets, device
+            pred_logits, pred_boxes, pred_severity, pred_quality, targets, device
         )
 
         # Aux losses — ramp weight from 0.1 to 1.0 over 50 epochs
@@ -174,7 +186,7 @@ class TotalLoss(nn.Module):
         for aux in aux_outputs:
             al, _ = self.compute_layer_loss(
                 aux['pred_logits'], aux['pred_boxes'],
-                aux['pred_severity'], targets, device
+                aux['pred_severity'], aux.get('pred_quality'), targets, device
             )
             aux_loss = aux_loss + al
 
