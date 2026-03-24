@@ -2,6 +2,7 @@
 
 import argparse
 import os
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -34,6 +35,20 @@ DEFAULT_CONFIG_PATH = os.path.join(
     "configs",
     "dense_det.yaml",
 )
+
+
+def config_section(config, key):
+    """Return a config subsection or an empty dict if it is malformed."""
+    value = config.get(key, {})
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    print(
+        f"Warning: config section '{key}' should be a mapping, got {type(value).__name__}. "
+        "Ignoring that section."
+    )
+    return {}
 
 
 def parse_args():
@@ -108,10 +123,15 @@ def resolve_checkpoint_path(checkpoint_arg, config):
 
 def resolve_args(args):
     config = load_yaml_config(args.config)
-    model_cfg = config.get("model", {})
-    data_cfg = config.get("data", {})
-    train_cfg = config.get("train", {})
-    eval_cfg = config.get("eval", {})
+    if not isinstance(config, Mapping):
+        raise ValueError(
+            f"Config file '{args.config}' must parse to a dictionary at the top level."
+        )
+
+    model_cfg = config_section(config, "model")
+    data_cfg = config_section(config, "data")
+    train_cfg = config_section(config, "train")
+    eval_cfg = config_section(config, "eval")
 
     data_format = coalesce(args.data_format, data_cfg.get("format"), "detection")
     class_names = normalize_class_names(data_cfg.get("class_names"))
