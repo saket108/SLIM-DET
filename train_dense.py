@@ -208,6 +208,17 @@ def resolve_args(args):
     }
 
     if resolved["data_format"] == "detection":
+        missing = [
+            name for name in ("train_images", "val_images", "train_labels", "val_labels")
+            if resolved[name] is None
+        ]
+        if missing:
+            raise ValueError(
+                "Detection format requires a dataset root with standard split folders "
+                "('images/train', 'images/val', 'labels/train', 'labels/val'), "
+                "a valid data.yaml via --data_config, or explicit --train_images/--val_images/--train_labels/--val_labels. "
+                f"Missing: {', '.join(missing)}"
+            )
         require_existing_paths(
             data_config=resolved["data_config"],
             train_images=resolved["train_images"],

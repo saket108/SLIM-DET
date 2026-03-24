@@ -125,17 +125,24 @@ def resolve_detection_paths(
         resolved_root = next((path for path in candidates if os.path.exists(path)), candidates[0])
 
     split_images = coalesce(images_dir, config.get(split), config.get(f'{split}_images'))
+    if split_images is None and resolved_root is not None:
+        split_images = os.path.join('images', split)
     resolved_images = resolve_path(
         split_images,
         resolved_root or config_root,
     )
 
     split_labels = coalesce(labels_dir, config.get(f'{split}_labels'))
-    resolved_labels = resolve_path(
-        split_labels,
-        resolved_root or config_root,
-    )
-    if resolved_labels is None:
+    if split_labels is not None:
+        resolved_labels = resolve_path(
+            split_labels,
+            resolved_root or config_root,
+        )
+    elif resolved_root is not None:
+        resolved_labels = os.path.join(resolved_root, 'labels', split)
+    else:
+        resolved_labels = None
+    if resolved_labels is None and resolved_images is not None:
         resolved_labels = infer_label_dir(resolved_images)
 
     class_names = normalize_class_names(config.get('names'))

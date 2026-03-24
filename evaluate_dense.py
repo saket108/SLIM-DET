@@ -219,6 +219,16 @@ def resolve_args(args):
     }
 
     if resolved["data_format"] == "detection":
+        missing = [
+            name for name in ("images_dir", "labels_dir")
+            if resolved[name] is None
+        ]
+        if missing:
+            raise ValueError(
+                "Detection format requires a dataset root with standard split folders, "
+                "a valid data.yaml via --data_config, or explicit --val_images/--val_labels "
+                f"(or test equivalents). Missing: {', '.join(missing)}"
+            )
         require_existing_paths(
             data_config=resolved["data_config"],
             images_dir=resolved["images_dir"],
