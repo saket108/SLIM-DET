@@ -28,6 +28,7 @@ DEFAULT_IMAGE_PROMPT = "No damage detected in this inspection image."
 DEFAULT_IMAGE_ZONE = "unknown"
 DEFAULT_IMAGE_METRICS = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float32)
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+CLASS_ID_TO_NAME = {class_id: name for name, class_id in CLASS_NAME_TO_ID.items()}
 
 
 def make_transforms(image_size: int = 640, is_train: bool = True):
@@ -426,39 +427,84 @@ def build_batch_context(targets, device):
 
 # ── Class-balanced sampler ────────────────────────────────────
 class ClassBalancedSampler(torch.utils.data.Sampler):
-    """
-    Oversamples images containing rare classes.
-    Ensures every batch sees scratch and missing-head examples.
-    """
+    """Oversample images containing rare classes using dataset-driven weights."""
 
-    # Inverse-frequency weights per class
-    CLASS_WEIGHTS = {
-        0: 0.18,   # crack
-        1: 0.12,   # dent          (most common, lowest weight)
-        2: 0.48,   # corrosion
-        3: 0.65,   # scratch       (rarest, highest weight)
-        4: 0.42,   # missing-head
-        5: 0.58,   # paint-peel-off
-    }
-
-    def __init__(self, dataset: AircraftDataset, num_samples: int = None):
-        self.dataset     = dataset
+    def __init__(
+        self,
+        dataset: Dataset,
+        num_samples: int = None,
+        rarity_power: float = 0.5,
+        background_weight: float = None,
+    ):
+        self.dataset = dataset
         self.num_samples = num_samples or len(dataset)
+        self.rarity_power = rarity_power
 
-        # Assign weight to each image based on rarest class it contains
-        self.weights = []
         sample_class_ids = getattr(dataset, 'sample_class_ids', None)
         if sample_class_ids is None:
             raise ValueError("Dataset does not expose sample_class_ids for balanced sampling.")
 
+        image_class_counts = Counter()
         for class_ids in sample_class_ids:
-            if not class_ids:
-                self.weights.append(0.05)   # background — very low
-                continue
-            w = max(self.CLASS_WEIGHTS.get(class_id, 0.1) for class_id in class_ids)
-            self.weights.append(w)
+            image_class_counts.update(set(class_ids))
 
-        self.weights = torch.tensor(self.weights, dtype=torch.float32)
+        if not image_class_counts:
+            self.class_weights = {}
+            self.background_weight = 1.0
+            self.weights = torch.ones(len(sample_class_ids), dtype=torch.float32)
+            return
+
+        raw_weights = {
+            class_id: 1.0 / float(max(count, 1)) ** rarity_power
+            for class_id, count in image_class_counts.items()
+        }
+        max_weight = max(raw_weights.values())
+        self.class_weights = {
+            class_id: weight / max_weight
+            for class_id, weight in raw_weights.items()
+        }
+
+        min_class_weight = min(self.class_weights.values())
+        self.background_weight = (
+            background_weight
+            if background_weight is not None
+            else max(min_class_weight * 0.5, 0.05)
+        )
+
+        sample_weights = []
+        for class_ids in sample_class_ids:
+            unique_ids = sorted(set(class_ids))
+            if not unique_ids:
+                sample_weights.append(self.background_weight)
+                continue
+
+            rarest_class_weight = max(
+                self.class_weights.get(class_id, min_class_weight)
+                for class_id in unique_ids
+            )
+            diversity_boost = 1.0 + 0.05 * max(len(unique_ids) - 1, 0)
+            sample_weights.append(rarest_class_weight * diversity_boost)
+
+        self.weights = torch.tensor(sample_weights, dtype=torch.float32)
+        self._print_sampler_stats(image_class_counts)
+
+    def _class_name(self, class_id):
+        if hasattr(self.dataset, '_class_name'):
+            return self.dataset._class_name(class_id)
+
+        class_names = getattr(self.dataset, 'class_names', None) or []
+        if 0 <= class_id < len(class_names):
+            return class_names[class_id]
+
+        return CLASS_ID_TO_NAME.get(class_id, f'class_{class_id}')
+
+    def _print_sampler_stats(self, image_class_counts):
+        print("  Balanced sampler:")
+        for class_id, count in sorted(image_class_counts.items(), key=lambda item: (item[1], item[0])):
+            print(
+                f"    {self._class_name(class_id):<16}: "
+                f"img_freq={count:<5d} weight={self.class_weights[class_id]:.3f}"
+            )
 
     def __iter__(self):
         indices = torch.multinomial(

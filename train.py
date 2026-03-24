@@ -73,6 +73,8 @@ def parse_args():
     parser.add_argument('--eval_conf', type=float, default=None)
     parser.add_argument('--eval_iou', type=float, default=None)
     parser.add_argument('--eval_nms_iou', type=float, default=None)
+    parser.add_argument('--balanced_sampler', dest='balanced_sampler', action='store_true')
+    parser.add_argument('--no_balanced_sampler', dest='balanced_sampler', action='store_false')
 
     parser.add_argument(
         '--prompt_mode',
@@ -97,7 +99,12 @@ def parse_args():
         action='store_true',
         help='Disable pretrained timm weights and use random-init/fallback backbone.',
     )
-    parser.set_defaults(freeze_text=None, image_only=None, use_quality_head=None)
+    parser.set_defaults(
+        freeze_text=None,
+        image_only=None,
+        use_quality_head=None,
+        balanced_sampler=None,
+    )
     return parser.parse_args()
 
 
@@ -196,6 +203,7 @@ def resolve_args(args):
             if args.workers is not None
             else (0 if os.name == 'nt' else coalesce(train_cfg.get('num_workers'), 0))
         ),
+        'balanced_sampler': coalesce(args.balanced_sampler, train_cfg.get('balanced_sampler'), True),
         'save_dir': coalesce(args.save_dir, checkpoint_cfg.get('save_dir'), 'runs/slim_det'),
         'resume': args.resume,
         'text_model': coalesce(args.text_model, model_cfg.get('text_model'), 'minilm'),
@@ -548,6 +556,7 @@ def main():
     print(f"Hidden dim   : {args.hidden_dim}")
     print(f"Batch size   : {args.batch}")
     print(f"Classes      : {args.num_classes}")
+    print(f"Balanced samp: {args.balanced_sampler}")
     print(f"Dataset root : {args.dataset_root}")
 
     print("\nBuilding SLIM-Det...")
@@ -567,7 +576,7 @@ def main():
         image_size=args.imgsz,
         prompt_mode=args.prompt_mode,
         num_workers=args.workers,
-        balanced=(args.data_format == 'json'),
+        balanced=args.balanced_sampler,
         data_format=args.data_format,
         labels_dir=args.train_labels,
         class_names=args.class_names,

@@ -80,6 +80,8 @@ def parse_args():
     parser.add_argument("--eval_iou", type=float, default=None)
     parser.add_argument("--eval_nms_iou", type=float, default=None)
     parser.add_argument("--save_every_batches", type=int, default=None)
+    parser.add_argument("--balanced_sampler", dest="balanced_sampler", action="store_true")
+    parser.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false")
 
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--variant", type=str, default=None)
@@ -93,7 +95,7 @@ def parse_args():
     parser.add_argument("--quality_head", dest="use_quality_head", action="store_true")
     parser.add_argument("--no_quality_head", dest="use_quality_head", action="store_false")
     parser.add_argument("--no_pretrained_backbone", action="store_true")
-    parser.set_defaults(use_detail_branch=None, use_quality_head=None)
+    parser.set_defaults(use_detail_branch=None, use_quality_head=None, balanced_sampler=None)
     return parser.parse_args()
 
 
@@ -184,12 +186,13 @@ def resolve_args(args):
             if args.workers is not None
             else (0 if os.name == "nt" else coalesce(train_cfg.get("num_workers"), 0))
         ),
+        "balanced_sampler": coalesce(args.balanced_sampler, train_cfg.get("balanced_sampler"), True),
         "save_dir": coalesce(args.save_dir, checkpoint_cfg.get("save_dir"), "runs/dense_det"),
         "resume": args.resume,
         "num_classes": num_classes,
         "class_names": class_names,
         "variant": coalesce(args.variant, model_cfg.get("variant"), "small"),
-        "backbone_name": coalesce(args.backbone_name, model_cfg.get("backbone_name"), "mobilenet"),
+        "backbone_name": coalesce(args.backbone_name, model_cfg.get("backbone_name"), "convnext_tiny"),
         "neck_name": coalesce(args.neck_name, model_cfg.get("neck_name"), "cafpn"),
         "head_depth": coalesce(args.head_depth, model_cfg.get("head_depth"), 2),
         "use_detail_branch": coalesce(args.use_detail_branch, model_cfg.get("use_detail_branch"), False),
@@ -494,6 +497,7 @@ def main():
     print(f"Epochs       : {args.epochs}")
     print(f"Batch size   : {args.batch}")
     print(f"Classes      : {args.num_classes}")
+    print(f"Balanced samp: {args.balanced_sampler}")
     print(f"Dataset root : {args.dataset_root}")
 
     print("\nBuilding DenseDet...")
@@ -512,7 +516,7 @@ def main():
         image_size=args.imgsz,
         prompt_mode="cat_only",
         num_workers=args.workers,
-        balanced=(args.data_format == "json"),
+        balanced=args.balanced_sampler,
         data_format=args.data_format,
         labels_dir=args.train_labels,
         class_names=args.class_names,

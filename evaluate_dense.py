@@ -205,7 +205,7 @@ def resolve_args(args):
         "num_classes": num_classes,
         "class_names": class_names,
         "variant": coalesce(args.variant, model_cfg.get("variant"), "small"),
-        "backbone_name": coalesce(args.backbone_name, model_cfg.get("backbone_name"), "mobilenet"),
+        "backbone_name": coalesce(args.backbone_name, model_cfg.get("backbone_name"), "convnext_tiny"),
         "neck_name": coalesce(args.neck_name, model_cfg.get("neck_name"), "cafpn"),
         "head_depth": coalesce(args.head_depth, model_cfg.get("head_depth"), 2),
         "use_detail_branch": coalesce(args.use_detail_branch, model_cfg.get("use_detail_branch"), False),
