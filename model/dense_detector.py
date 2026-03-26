@@ -24,11 +24,14 @@ from model.dense_blocks import (
     SpatialChannelGate,
     WeightedFeatureFusion,
 )
+from model.vst_backbone import VSTBackbone
 from utils.box_ops import distance_to_boxes, xyxy_abs_to_cxcywh_norm
 from utils.points import build_points
 
 
 BACKBONE_ALIASES = {
+    "vst": "vst",
+    "vst_backbone": "vst",
     "mobilenet": "mobilenetv3_large_100",
     "mobilenetv3": "mobilenetv3_large_100",
     "mobilenetv3_large": "mobilenetv3_large_100",
@@ -91,6 +94,15 @@ class TimmBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         features = self.backbone(x)
         return tuple(features[-4:])
+
+
+def build_backbone(model_name: str, pretrained: bool = True) -> nn.Module:
+    resolved_name = BACKBONE_ALIASES.get(model_name, model_name)
+    if resolved_name == "vst":
+        if pretrained:
+            print("  VST backbone uses random initialization only (ignoring pretrained_backbone=True)")
+        return VSTBackbone()
+    return TimmBackbone(resolved_name, pretrained=pretrained)
 
 
 class BiFusionNeck(nn.Module):
@@ -348,7 +360,9 @@ class DenseDet(nn.Module):
         self.use_detail_branch = use_detail_branch
         self.use_quality_head = use_quality_head
 
-        self.backbone = TimmBackbone(self.backbone_name, pretrained=pretrained_backbone)
+        self.backbone = build_backbone(self.backbone_name, pretrained=pretrained_backbone)
+        if self.backbone_name == "vst":
+            self.pretrained_backbone = False
         self.uses_stride2_path = use_detail_branch or neck_name == "cafpn_p2"
         self.detail_stem = DetailStem(cfg.detail_channels) if self.uses_stride2_path else None
 
