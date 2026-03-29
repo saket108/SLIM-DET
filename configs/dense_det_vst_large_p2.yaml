@@ -1,8 +1,8 @@
 model:
   variant: small
-  backbone_name: convnext_tiny
-  pretrained_backbone: true
-  neck_name: cafpn
+  backbone_name: vst_large
+  pretrained_backbone: false
+  neck_name: cafpn_p2
   head_depth: 2
   use_detail_branch: false
   use_quality_head: true
@@ -19,7 +19,7 @@ train:
   batch_size: 8
   image_size: 640
   num_workers: 2
-  balanced_sampler: true
+  balanced_sampler: false
 
 optimizer:
   lr: 0.0004
@@ -33,7 +33,7 @@ loss:
   quality: 1.0
 
 checkpoint:
-  save_dir: runs/dense_det
+  save_dir: runs/dense_det_vst_large_p2
   save_period_batches: 200
 
 eval:

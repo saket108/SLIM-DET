@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import math
 import os
 import sys
 import time
@@ -11,7 +12,6 @@ import torch
 from torch import amp
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     from tqdm.auto import tqdm
@@ -38,6 +38,79 @@ DEFAULT_CONFIG_PATH = os.path.join(
     "configs",
     "dense_det.yaml",
 )
+
+
+class WarmupCosineScheduler:
+    """Epoch-based linear warmup followed by cosine decay."""
+
+    def __init__(
+        self,
+        optimizer,
+        total_epochs: int,
+        warmup_epochs: int = 0,
+        min_lr_ratio: float = 0.01,
+        last_epoch: int = 0,
+    ) -> None:
+        self.optimizer = optimizer
+        self.total_epochs = max(int(total_epochs), 1)
+        self.warmup_epochs = max(int(warmup_epochs), 0)
+        self.min_lr_ratio = float(min_lr_ratio)
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+        self.min_lrs = [lr * self.min_lr_ratio for lr in self.base_lrs]
+        self.last_epoch = int(last_epoch)
+        self._set_lrs(self._compute_lrs(self.last_epoch))
+
+    def _compute_lrs(self, epoch_index: int) -> list[float]:
+        epoch_index = max(epoch_index, 0)
+        lrs = []
+        for base_lr, min_lr in zip(self.base_lrs, self.min_lrs):
+            if self.warmup_epochs > 0 and epoch_index < self.warmup_epochs:
+                scale = float(epoch_index + 1) / float(self.warmup_epochs)
+                lrs.append(base_lr * scale)
+                continue
+
+            if self.total_epochs <= self.warmup_epochs:
+                lrs.append(base_lr)
+                continue
+
+            progress = (epoch_index - self.warmup_epochs) / max(
+                self.total_epochs - self.warmup_epochs,
+                1,
+            )
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            lrs.append(min_lr + (base_lr - min_lr) * cosine)
+        return lrs
+
+    def _set_lrs(self, lrs: list[float]) -> None:
+        for param_group, lr in zip(self.optimizer.param_groups, lrs):
+            param_group["lr"] = lr
+
+    def step(self) -> None:
+        self.last_epoch += 1
+        self._set_lrs(self._compute_lrs(self.last_epoch))
+
+    def get_last_lr(self) -> list[float]:
+        return [group["lr"] for group in self.optimizer.param_groups]
+
+    def state_dict(self) -> dict:
+        return {
+            "total_epochs": self.total_epochs,
+            "warmup_epochs": self.warmup_epochs,
+            "min_lr_ratio": self.min_lr_ratio,
+            "base_lrs": self.base_lrs,
+            "min_lrs": self.min_lrs,
+            "last_epoch": self.last_epoch,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.total_epochs = int(state_dict.get("total_epochs", self.total_epochs))
+        self.warmup_epochs = int(state_dict.get("warmup_epochs", self.warmup_epochs))
+        self.min_lr_ratio = float(state_dict.get("min_lr_ratio", self.min_lr_ratio))
+        self.base_lrs = list(state_dict.get("base_lrs", self.base_lrs))
+        self.min_lrs = list(state_dict.get("min_lrs", self.min_lrs))
+        self.last_epoch = int(state_dict.get("last_epoch", self.last_epoch))
+        self._set_lrs(self._compute_lrs(self.last_epoch))
 
 
 def config_section(config, key):
@@ -68,6 +141,7 @@ def parse_args():
     parser.add_argument("--val_labels", type=str, default=None)
 
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--imgsz", type=int, default=None)
@@ -82,6 +156,8 @@ def parse_args():
     parser.add_argument("--save_every_batches", type=int, default=None)
     parser.add_argument("--balanced_sampler", dest="balanced_sampler", action="store_true")
     parser.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false")
+    parser.add_argument("--warmup_epochs", type=int, default=None)
+    parser.add_argument("--min_lr_ratio", type=float, default=None)
 
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--variant", type=str, default=None)
@@ -110,6 +186,7 @@ def resolve_args(args):
     data_cfg = config_section(config, "data")
     train_cfg = config_section(config, "train")
     optimizer_cfg = config_section(config, "optimizer")
+    scheduler_cfg = config_section(config, "scheduler")
     checkpoint_cfg = config_section(config, "checkpoint")
     eval_cfg = config_section(config, "eval")
     loss_cfg = config_section(config, "loss")
@@ -178,6 +255,7 @@ def resolve_args(args):
         "train_labels": train_labels,
         "val_labels": val_labels,
         "epochs": coalesce(args.epochs, train_cfg.get("epochs"), 300),
+        "patience": coalesce(args.patience, train_cfg.get("patience"), 0),
         "batch": coalesce(args.batch, train_cfg.get("batch_size"), 8),
         "lr": coalesce(args.lr, optimizer_cfg.get("lr"), 4e-4),
         "imgsz": coalesce(args.imgsz, train_cfg.get("image_size"), data_cfg.get("image_size"), 640),
@@ -187,6 +265,8 @@ def resolve_args(args):
             else (0 if os.name == "nt" else coalesce(train_cfg.get("num_workers"), 0))
         ),
         "balanced_sampler": coalesce(args.balanced_sampler, train_cfg.get("balanced_sampler"), True),
+        "warmup_epochs": coalesce(args.warmup_epochs, scheduler_cfg.get("warmup_epochs"), 10),
+        "min_lr_ratio": coalesce(args.min_lr_ratio, scheduler_cfg.get("eta_min_ratio"), 0.01),
         "save_dir": coalesce(args.save_dir, checkpoint_cfg.get("save_dir"), "runs/dense_det"),
         "resume": args.resume,
         "num_classes": num_classes,
@@ -311,6 +391,9 @@ def save_checkpoint(
     total_batches=None,
     global_step=None,
     is_mid_epoch=False,
+    best_val=None,
+    best_epoch=None,
+    epochs_without_improvement=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"dense_det_{tag}.pt")
@@ -327,6 +410,9 @@ def save_checkpoint(
             "global_step": global_step,
             "is_mid_epoch": is_mid_epoch,
             "model_config": model_config,
+            "best_val": best_val,
+            "best_epoch": best_epoch,
+            "epochs_without_improvement": epochs_without_improvement,
         },
         path,
     )
@@ -495,9 +581,11 @@ def main():
     print(f"Neck         : {args.neck_name}")
     print(f"Quality head : {args.use_quality_head}")
     print(f"Epochs       : {args.epochs}")
+    print(f"Patience     : {args.patience or 'disabled'}")
     print(f"Batch size   : {args.batch}")
     print(f"Classes      : {args.num_classes}")
     print(f"Balanced samp: {args.balanced_sampler}")
+    print(f"Warmup epochs: {args.warmup_epochs}")
     print(f"Dataset root : {args.dataset_root}")
 
     print("\nBuilding DenseDet...")
@@ -547,15 +635,18 @@ def main():
         weight_decay=0.0005,
         betas=(0.9, 0.999),
     )
-    scheduler = CosineAnnealingLR(
+    scheduler = WarmupCosineScheduler(
         optimizer,
-        T_max=args.epochs,
-        eta_min=args.lr * 0.01,
+        total_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_ratio=args.min_lr_ratio,
     )
     scaler = amp.GradScaler(device.type, enabled=(device.type == "cuda"))
 
     start_epoch = 1
     best_val = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
     if args.resume:
         ckpt = resume_ckpt or torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -571,7 +662,9 @@ def main():
             )
         else:
             print(f"\nResumed from epoch {ckpt['epoch']}")
-        best_val = ckpt.get("val_loss", float("inf"))
+        best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
+        best_epoch = int(ckpt.get("best_epoch", 0))
+        epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
 
     print(f"\nStarting training for {args.epochs} epochs...")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -583,6 +676,8 @@ def main():
         "lr",
         "elapsed_sec",
         "best_val",
+        "best_epoch",
+        "epochs_without_improvement",
         "map50",
         "map5095",
         "macro_precision",
@@ -616,6 +711,9 @@ def main():
                 total_batches=total_batches,
                 global_step=global_step,
                 is_mid_epoch=True,
+                best_val=best_val,
+                best_epoch=best_epoch,
+                epochs_without_improvement=epochs_without_improvement,
             )
             print(
                 f"  Saved mid-epoch checkpoint: {path} "
@@ -659,6 +757,13 @@ def main():
         elapsed = time.time() - t0
         macro_precision = None if summary is None else summary["macro_precision"]
         macro_recall = None if summary is None else summary["macro_recall"]
+        improved = val_loss < best_val
+        if improved:
+            best_val = val_loss
+            best_epoch = epoch
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         print(
             f"{f'{epoch}/{args.epochs}':<10} "
             f"{train_loss:>10.4f} {val_loss:>10.4f} "
@@ -676,6 +781,8 @@ def main():
                 "lr": scheduler.get_last_lr()[0],
                 "elapsed_sec": elapsed,
                 "best_val": best_val,
+                "best_epoch": best_epoch,
+                "epochs_without_improvement": epochs_without_improvement,
                 "map50": map50,
                 "map5095": map5095,
                 "macro_precision": "" if summary is None else summary["macro_precision"],
@@ -699,10 +806,12 @@ def main():
             total_batches=len(train_loader),
             global_step=epoch * len(train_loader),
             is_mid_epoch=False,
+            best_val=best_val,
+            best_epoch=best_epoch,
+            epochs_without_improvement=epochs_without_improvement,
         )
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if improved:
             save_checkpoint(
                 model,
                 optimizer,
@@ -717,6 +826,9 @@ def main():
                 total_batches=len(train_loader),
                 global_step=epoch * len(train_loader),
                 is_mid_epoch=False,
+                best_val=best_val,
+                best_epoch=best_epoch,
+                epochs_without_improvement=epochs_without_improvement,
             )
             print(f"  New best val loss: {best_val:.4f}")
 
@@ -735,7 +847,18 @@ def main():
                 total_batches=len(train_loader),
                 global_step=epoch * len(train_loader),
                 is_mid_epoch=False,
+                best_val=best_val,
+                best_epoch=best_epoch,
+                epochs_without_improvement=epochs_without_improvement,
             )
+
+        if args.patience and epochs_without_improvement >= args.patience:
+            print(
+                f"  Early stopping triggered at epoch {epoch}: "
+                f"no val loss improvement for {epochs_without_improvement} epochs "
+                f"(best epoch: {best_epoch}, best val loss: {best_val:.4f})"
+            )
+            break
 
     print(f"\nTraining complete. Best val loss: {best_val:.4f}")
     print(f"Checkpoints saved to: {args.save_dir}")

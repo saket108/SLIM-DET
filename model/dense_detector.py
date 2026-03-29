@@ -32,6 +32,10 @@ from utils.points import build_points
 BACKBONE_ALIASES = {
     "vst": "vst",
     "vst_backbone": "vst",
+    "vst_s": "vst",
+    "vst_small": "vst",
+    "vst_l": "vst_large",
+    "vst_large": "vst_large",
     "mobilenet": "mobilenetv3_large_100",
     "mobilenetv3": "mobilenetv3_large_100",
     "mobilenetv3_large": "mobilenetv3_large_100",
@@ -39,6 +43,17 @@ BACKBONE_ALIASES = {
     "convnext_tiny": "convnext_tiny",
     "convnextv2": "convnextv2_tiny.fcmae_ft_in22k_in1k",
     "convnextv2_tiny": "convnextv2_tiny.fcmae_ft_in22k_in1k",
+}
+
+VST_PRESETS = {
+    "vst": {
+        "dims": (32, 64, 128, 256),
+        "depths": (2, 2, 4, 2),
+    },
+    "vst_large": {
+        "dims": (60, 120, 240, 480),
+        "depths": (2, 2, 4, 2),
+    },
 }
 
 
@@ -98,10 +113,11 @@ class TimmBackbone(nn.Module):
 
 def build_backbone(model_name: str, pretrained: bool = True) -> nn.Module:
     resolved_name = BACKBONE_ALIASES.get(model_name, model_name)
-    if resolved_name == "vst":
+    if resolved_name in VST_PRESETS:
         if pretrained:
             print("  VST backbone uses random initialization only (ignoring pretrained_backbone=True)")
-        return VSTBackbone()
+        preset = VST_PRESETS[resolved_name]
+        return VSTBackbone(dims=preset["dims"], depths=preset["depths"])
     return TimmBackbone(resolved_name, pretrained=pretrained)
 
 
@@ -361,7 +377,7 @@ class DenseDet(nn.Module):
         self.use_quality_head = use_quality_head
 
         self.backbone = build_backbone(self.backbone_name, pretrained=pretrained_backbone)
-        if self.backbone_name == "vst":
+        if self.backbone_name in VST_PRESETS:
             self.pretrained_backbone = False
         self.uses_stride2_path = use_detail_branch or neck_name == "cafpn_p2"
         self.detail_stem = DetailStem(cfg.detail_channels) if self.uses_stride2_path else None
