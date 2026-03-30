@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
+from PIL import ImageFilter, ImageOps
 
 from data.prompt_builder import (
     CLASS_NAME_TO_ID,
@@ -39,6 +40,102 @@ def make_transforms(image_size: int = 640, is_train: bool = True):
     transforms.append(T.ToTensor())
     transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return T.Compose(transforms)
+
+
+class DetectionAugmenter:
+    """Lightweight YOLO-style augmentation with scheduled shutdown."""
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        close_after_epochs: int = 10,
+        fliplr: float = 0.5,
+        hsv_h: float = 0.015,
+        hsv_s: float = 0.7,
+        hsv_v: float = 0.4,
+        blur_prob: float = 0.01,
+        grayscale_prob: float = 0.01,
+        equalize_prob: float = 0.01,
+        erasing_prob: float = 0.4,
+    ) -> None:
+        self.enabled = enabled
+        self.close_after_epochs = max(int(close_after_epochs), 0)
+        self.fliplr = float(fliplr)
+        self.hsv_h = float(hsv_h)
+        self.hsv_s = float(hsv_s)
+        self.hsv_v = float(hsv_v)
+        self.blur_prob = float(blur_prob)
+        self.grayscale_prob = float(grayscale_prob)
+        self.equalize_prob = float(equalize_prob)
+        self.erasing_prob = float(erasing_prob)
+        self.current_epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = max(int(epoch), 1)
+
+    @property
+    def active(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.close_after_epochs <= 0:
+            return True
+        return self.current_epoch <= self.close_after_epochs
+
+    def _apply_pil(self, image: Image.Image) -> Image.Image:
+        import random
+        import torchvision.transforms.functional as TF
+
+        if self.hsv_h > 0:
+            hue = random.uniform(-self.hsv_h, self.hsv_h)
+            image = TF.adjust_hue(image, hue)
+        if self.hsv_s > 0:
+            sat = 1.0 + random.uniform(-self.hsv_s, self.hsv_s)
+            image = TF.adjust_saturation(image, max(sat, 0.0))
+        if self.hsv_v > 0:
+            bri = 1.0 + random.uniform(-self.hsv_v, self.hsv_v)
+            image = TF.adjust_brightness(image, max(bri, 0.0))
+
+        if random.random() < self.blur_prob:
+            radius = random.uniform(0.5, 1.5)
+            image = image.filter(ImageFilter.GaussianBlur(radius=radius))
+        if random.random() < self.grayscale_prob:
+            image = ImageOps.grayscale(image).convert("RGB")
+        if random.random() < self.equalize_prob:
+            image = ImageOps.equalize(image)
+        return image
+
+    def _apply_tensor(self, image: torch.Tensor) -> torch.Tensor:
+        import torchvision.transforms as T
+
+        if self.erasing_prob > 0.0:
+            eraser = T.RandomErasing(
+                p=self.erasing_prob,
+                scale=(0.02, 0.15),
+                ratio=(0.3, 3.3),
+                value="random",
+            )
+            image = eraser(image)
+        return image
+
+    def __call__(self, image: Image.Image, boxes: torch.Tensor | None = None):
+        import random
+        import torchvision.transforms.functional as TF
+
+        boxes = None if boxes is None else boxes.clone()
+        if not self.active:
+            return image, boxes
+
+        image = self._apply_pil(image)
+        if random.random() < self.fliplr:
+            image = TF.hflip(image)
+            if boxes is not None and boxes.numel() > 0:
+                boxes[:, 0] = 1.0 - boxes[:, 0]
+        return image, boxes
+
+    def apply_tensor(self, image: torch.Tensor) -> torch.Tensor:
+        if not self.active:
+            return image
+        return self._apply_tensor(image)
 
 
 def _empty_target(image_id=''):
@@ -153,6 +250,7 @@ class AircraftDataset(Dataset):
         prompt_mode:  str  = 'full',
         is_train:     bool = True,
         max_anns:     int  = 100,
+        augmenter: DetectionAugmenter | None = None,
     ):
         """
         Args:
@@ -169,6 +267,7 @@ class AircraftDataset(Dataset):
         self.is_train    = is_train
         self.max_anns    = max_anns
         self.transform   = make_transforms(image_size, is_train)
+        self.augmenter   = augmenter
 
         # Load JSON
         with open(json_path, 'r') as f:
@@ -210,12 +309,6 @@ class AircraftDataset(Dataset):
 
         # ── Load image ────────────────────────────────────────
         image = Image.open(img_path).convert('RGB')
-        orig_w, orig_h = image.size
-        image = self.transform(image)   # [3, H, W]
-
-        # ── Background image (no annotations) ─────────────────
-        if not anns:
-            return image, self._empty_target(image_id), image_id
 
         # ── Parse annotations ──────────────────────────────────
         boxes       = []   # [N, 4] normalized cx cy w h
@@ -257,6 +350,18 @@ class AircraftDataset(Dataset):
             # Zone
             zones.append(ann.get('zone_estimation', 'unknown'))
 
+        boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32)
+        if self.is_train and self.augmenter is not None:
+            image, boxes_tensor = self.augmenter(image, boxes_tensor)
+
+        image = self.transform(image)
+        if self.is_train and self.augmenter is not None:
+            image = self.augmenter.apply_tensor(image)
+
+        # ── Background image (no annotations) ─────────────────
+        if not anns:
+            return image, self._empty_target(image_id), image_id
+
         # Build text prompts
         prompts = build_batch_prompts(anns[:self.max_anns], mode=self.prompt_mode)
         image_prompt = get_image_level_prompt(
@@ -268,7 +373,7 @@ class AircraftDataset(Dataset):
 
         # ── Convert to tensors ─────────────────────────────────
         target = {
-            'boxes':      torch.tensor(boxes,      dtype=torch.float32),
+            'boxes':      boxes_tensor,
             'labels':     torch.tensor(labels,     dtype=torch.long),
             'metrics':    torch.tensor(metrics,    dtype=torch.float32),
             'severities': torch.tensor(severities, dtype=torch.float32),
@@ -299,6 +404,7 @@ class StandardDetectionDataset(Dataset):
         image_size: int = 640,
         class_names: list = None,
         is_train: bool = True,
+        augmenter: DetectionAugmenter | None = None,
     ):
         self.images_dir = images_dir
         self.labels_dir = labels_dir
@@ -306,6 +412,7 @@ class StandardDetectionDataset(Dataset):
         self.is_train = is_train
         self.transform = make_transforms(image_size, is_train)
         self.class_names = class_names or []
+        self.augmenter = augmenter
 
         image_paths = _list_image_files(images_dir)
         self.records = []
@@ -345,11 +452,16 @@ class StandardDetectionDataset(Dataset):
     def __getitem__(self, idx):
         record = self.records[idx]
         image = Image.open(record['image_path']).convert('RGB')
-        image = self.transform(image)
         target = _detection_target_from_annotations(
             record['annotations'],
             image_id=record['image_id'],
         )
+        if self.is_train and self.augmenter is not None:
+            image, boxes = self.augmenter(image, target['boxes'])
+            target['boxes'] = boxes if boxes is not None else target['boxes']
+        image = self.transform(image)
+        if self.is_train and self.augmenter is not None:
+            image = self.augmenter.apply_tensor(image)
         return image, target, record['image_id']
 
 
@@ -528,6 +640,7 @@ def build_train_loader(
     data_format: str = 'json',
     labels_dir:  str = None,
     class_names: list = None,
+    augmenter: DetectionAugmenter | None = None,
 ) -> DataLoader:
     if data_format == 'detection':
         dataset = StandardDetectionDataset(
@@ -536,6 +649,7 @@ def build_train_loader(
             image_size=image_size,
             class_names=class_names,
             is_train=True,
+            augmenter=augmenter,
         )
     else:
         dataset = AircraftDataset(
@@ -544,6 +658,7 @@ def build_train_loader(
             image_size  = image_size,
             prompt_mode = prompt_mode,
             is_train    = True,
+            augmenter=augmenter,
         )
 
     if len(dataset) == 0:

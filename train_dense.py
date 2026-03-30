@@ -18,7 +18,7 @@ try:
 except ImportError:
     tqdm = None
 
-from data.loader import build_train_loader, build_val_loader
+from data.loader import DetectionAugmenter, build_train_loader, build_val_loader
 from evaluate_dense import run_dense_evaluation
 from model.dense_detector import DenseDet
 from training.dense_loss import DenseDetectionLoss
@@ -156,6 +156,9 @@ def parse_args():
     parser.add_argument("--save_every_batches", type=int, default=None)
     parser.add_argument("--balanced_sampler", dest="balanced_sampler", action="store_true")
     parser.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false")
+    parser.add_argument("--augment", dest="augment", action="store_true")
+    parser.add_argument("--no_augment", dest="augment", action="store_false")
+    parser.add_argument("--close_augment_after_epochs", type=int, default=None)
     parser.add_argument("--warmup_epochs", type=int, default=None)
     parser.add_argument("--min_lr_ratio", type=float, default=None)
 
@@ -164,14 +167,23 @@ def parse_args():
     parser.add_argument("--backbone_name", type=str, default=None)
     parser.add_argument("--neck_name", type=str, default=None)
     parser.add_argument("--head_depth", type=int, default=None)
+    parser.add_argument("--use_auxiliary_heads", dest="use_auxiliary_heads", action="store_true")
+    parser.add_argument("--no_use_auxiliary_heads", dest="use_auxiliary_heads", action="store_false")
     parser.add_argument("--assigner", type=str, default=None, choices=["fcos", "atss"])
     parser.add_argument("--quality_loss_weight", type=float, default=None)
+    parser.add_argument("--auxiliary_loss_weight", type=float, default=None)
     parser.add_argument("--detail_branch", dest="use_detail_branch", action="store_true")
     parser.add_argument("--no_detail_branch", dest="use_detail_branch", action="store_false")
     parser.add_argument("--quality_head", dest="use_quality_head", action="store_true")
     parser.add_argument("--no_quality_head", dest="use_quality_head", action="store_false")
     parser.add_argument("--no_pretrained_backbone", action="store_true")
-    parser.set_defaults(use_detail_branch=None, use_quality_head=None, balanced_sampler=None)
+    parser.set_defaults(
+        use_detail_branch=None,
+        use_quality_head=None,
+        use_auxiliary_heads=None,
+        augment=None,
+        balanced_sampler=None,
+    )
     return parser.parse_args()
 
 
@@ -190,6 +202,7 @@ def resolve_args(args):
     checkpoint_cfg = config_section(config, "checkpoint")
     eval_cfg = config_section(config, "eval")
     loss_cfg = config_section(config, "loss")
+    augmentation_cfg = config_section(config, "augmentation")
 
     data_format = coalesce(args.data_format, data_cfg.get("format"), "detection")
     class_names = normalize_class_names(data_cfg.get("class_names"))
@@ -265,6 +278,12 @@ def resolve_args(args):
             else (0 if os.name == "nt" else coalesce(train_cfg.get("num_workers"), 0))
         ),
         "balanced_sampler": coalesce(args.balanced_sampler, train_cfg.get("balanced_sampler"), True),
+        "augment": coalesce(args.augment, augmentation_cfg.get("enabled"), False),
+        "close_augment_after_epochs": coalesce(
+            args.close_augment_after_epochs,
+            augmentation_cfg.get("close_after_epochs"),
+            10,
+        ),
         "warmup_epochs": coalesce(args.warmup_epochs, scheduler_cfg.get("warmup_epochs"), 10),
         "min_lr_ratio": coalesce(args.min_lr_ratio, scheduler_cfg.get("eta_min_ratio"), 0.01),
         "save_dir": coalesce(args.save_dir, checkpoint_cfg.get("save_dir"), "runs/dense_det"),
@@ -277,11 +296,13 @@ def resolve_args(args):
         "head_depth": coalesce(args.head_depth, model_cfg.get("head_depth"), 2),
         "use_detail_branch": coalesce(args.use_detail_branch, model_cfg.get("use_detail_branch"), False),
         "use_quality_head": coalesce(args.use_quality_head, model_cfg.get("use_quality_head"), True),
+        "use_auxiliary_heads": coalesce(args.use_auxiliary_heads, model_cfg.get("use_auxiliary_heads"), False),
         "pretrained_backbone": (
             False if args.no_pretrained_backbone else coalesce(model_cfg.get("pretrained_backbone"), True)
         ),
         "assigner": coalesce(args.assigner, loss_cfg.get("assigner"), "fcos"),
         "quality_loss_weight": coalesce(args.quality_loss_weight, loss_cfg.get("quality"), 1.0),
+        "auxiliary_loss_weight": coalesce(args.auxiliary_loss_weight, loss_cfg.get("auxiliary"), 0.0),
         "save_every_batches": coalesce(args.save_every_batches, checkpoint_cfg.get("save_period_batches"), 0),
         "eval_every_epochs": coalesce(args.eval_every_epochs, eval_cfg.get("during_train_every_epochs"), 5),
         "eval_max_batches": coalesce(args.eval_max_batches, eval_cfg.get("during_train_max_batches"), None),
@@ -332,6 +353,7 @@ def build_model_config(args):
         "head_depth": args.head_depth,
         "use_detail_branch": args.use_detail_branch,
         "use_quality_head": args.use_quality_head,
+        "use_auxiliary_heads": args.use_auxiliary_heads,
     }
 
 
@@ -361,6 +383,7 @@ def apply_checkpoint_model_config(args, checkpoint):
         "head_depth",
         "use_detail_branch",
         "use_quality_head",
+        "use_auxiliary_heads",
         "data_format",
     ):
         if key in model_config:
@@ -585,6 +608,8 @@ def main():
     print(f"Batch size   : {args.batch}")
     print(f"Classes      : {args.num_classes}")
     print(f"Balanced samp: {args.balanced_sampler}")
+    print(f"Augment      : {args.augment}")
+    print(f"Aug close ep : {args.close_augment_after_epochs}")
     print(f"Warmup epochs: {args.warmup_epochs}")
     print(f"Dataset root : {args.dataset_root}")
 
@@ -597,6 +622,10 @@ def main():
     print(f"  Trainable params : {counts['trainable']:,}")
 
     print("\nBuilding data loaders...")
+    train_augmenter = DetectionAugmenter(
+        enabled=args.augment,
+        close_after_epochs=args.close_augment_after_epochs,
+    )
     train_loader = build_train_loader(
         json_path=args.train_json,
         images_dir=args.train_images,
@@ -608,6 +637,7 @@ def main():
         data_format=args.data_format,
         labels_dir=args.train_labels,
         class_names=args.class_names,
+        augmenter=train_augmenter,
     )
     val_loader = build_val_loader(
         json_path=args.val_json,
@@ -628,6 +658,7 @@ def main():
         strides=model.strides,
         assigner=args.assigner,
         quality_loss_weight=args.quality_loss_weight,
+        auxiliary_loss_weight=args.auxiliary_loss_weight,
     )
     optimizer = AdamW(
         filter(lambda parameter: parameter.requires_grad, model.parameters()),
@@ -693,6 +724,8 @@ def main():
     global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
+        if hasattr(train_loader.dataset, "augmenter") and train_loader.dataset.augmenter is not None:
+            train_loader.dataset.augmenter.set_epoch(epoch)
 
         def checkpoint_callback(epoch, batch_in_epoch, total_batches, train_loss):
             nonlocal global_step

@@ -348,6 +348,74 @@ class DenseHead(nn.Module):
         return outputs
 
 
+class AuxiliaryDenseHead(nn.Module):
+    """Lightweight auxiliary heads used only during training."""
+
+    def __init__(
+        self,
+        channels: int,
+        num_classes: int,
+        strides: tuple[int, ...],
+        target_strides: tuple[int, ...] = (8, 16),
+        use_quality_head: bool = True,
+    ) -> None:
+        super().__init__()
+        target_stride_set = {int(value) for value in target_strides}
+        self.target_indices = [
+            index for index, stride in enumerate(strides) if int(stride) in target_stride_set
+        ]
+        self.target_strides = tuple(int(strides[index]) for index in self.target_indices)
+        self.use_quality_head = use_quality_head
+
+        self.cls_preds = nn.ModuleList(
+            [nn.Conv2d(channels, num_classes, 3, padding=1) for _ in self.target_indices]
+        )
+        self.box_preds = nn.ModuleList(
+            [nn.Conv2d(channels, 4, 3, padding=1) for _ in self.target_indices]
+        )
+        self.scales = nn.ModuleList([Scale() for _ in self.target_indices])
+        if self.use_quality_head:
+            self.quality_preds = nn.ModuleList(
+                [nn.Conv2d(channels, 1, 3, padding=1) for _ in self.target_indices]
+            )
+        else:
+            self.quality_preds = None
+
+        self._init_biases()
+
+    def _init_biases(self, prior_prob: float = 0.01) -> None:
+        cls_bias = math.log(prior_prob / (1.0 - prior_prob))
+        for layer in self.cls_preds:
+            nn.init.constant_(layer.bias, cls_bias)
+        for layer in self.box_preds:
+            nn.init.constant_(layer.bias, 1.0)
+        if self.quality_preds is not None:
+            for layer in self.quality_preds:
+                nn.init.constant_(layer.bias, 0.0)
+
+    def forward(
+        self,
+        features: tuple[torch.Tensor, ...],
+        image_size: tuple[int, int],
+    ) -> list[dict[str, list[torch.Tensor] | tuple[int, ...]]]:
+        outputs = []
+        for head_index, feature_index in enumerate(self.target_indices):
+            feature = features[feature_index]
+            current: dict[str, list[torch.Tensor] | tuple[int, ...]] = {
+                "cls": [self.cls_preds[head_index](feature)],
+            }
+            with torch.autocast(device_type=feature.device.type, enabled=False):
+                reg_logits = self.box_preds[head_index](feature.float())
+                reg_distances = F.softplus(self.scales[head_index](reg_logits)).clamp(max=1e4)
+            current["box"] = [reg_distances]
+            if self.quality_preds is not None:
+                current["quality"] = [self.quality_preds[head_index](feature)]
+            current["strides"] = (self.target_strides[head_index],)
+            current["image_size"] = image_size
+            outputs.append(current)
+        return outputs
+
+
 class DenseDet(nn.Module):
     """Dense detection baseline with a standard FPN-style pyramid."""
 
@@ -361,6 +429,8 @@ class DenseDet(nn.Module):
         head_depth: int = 2,
         use_detail_branch: bool = False,
         use_quality_head: bool = True,
+        use_auxiliary_heads: bool = False,
+        auxiliary_strides: tuple[int, ...] = (8, 16),
     ) -> None:
         super().__init__()
         if variant not in VARIANTS:
@@ -375,6 +445,8 @@ class DenseDet(nn.Module):
         self.head_depth = head_depth
         self.use_detail_branch = use_detail_branch
         self.use_quality_head = use_quality_head
+        self.use_auxiliary_heads = use_auxiliary_heads
+        self.auxiliary_strides = tuple(int(value) for value in auxiliary_strides)
 
         self.backbone = build_backbone(self.backbone_name, pretrained=pretrained_backbone)
         if self.backbone_name in VST_PRESETS:
@@ -412,6 +484,15 @@ class DenseDet(nn.Module):
             depth=head_depth,
             use_quality_head=use_quality_head,
         )
+        self.aux_head = None
+        if self.use_auxiliary_heads:
+            self.aux_head = AuxiliaryDenseHead(
+                cfg.head_channels,
+                num_classes,
+                strides=self.strides,
+                target_strides=self.auxiliary_strides,
+                use_quality_head=use_quality_head,
+            )
 
     def forward(self, images: torch.Tensor) -> dict[str, list[torch.Tensor] | tuple[int, ...]]:
         features = self.backbone(images)
@@ -425,6 +506,8 @@ class DenseDet(nn.Module):
         outputs = self.head(pyramid)
         outputs["strides"] = self.strides
         outputs["image_size"] = tuple(images.shape[-2:])
+        if self.training and self.aux_head is not None:
+            outputs["aux_outputs"] = self.aux_head(pyramid, outputs["image_size"])
         return outputs
 
     @torch.no_grad()

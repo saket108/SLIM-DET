@@ -36,6 +36,7 @@ class LossOutput:
     cls: torch.Tensor
     box: torch.Tensor
     qual: torch.Tensor
+    aux: torch.Tensor
     positives: int
 
 
@@ -51,6 +52,7 @@ class DenseDetectionLoss(nn.Module):
         atss_topk: int = 9,
         atss_anchor_scale: float = 4.0,
         quality_loss_weight: float = 1.0,
+        auxiliary_loss_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -61,6 +63,7 @@ class DenseDetectionLoss(nn.Module):
         self.atss_topk = atss_topk
         self.atss_anchor_scale = atss_anchor_scale
         self.quality_loss_weight = quality_loss_weight
+        self.auxiliary_loss_weight = auxiliary_loss_weight
         if self.assigner not in {"fcos", "atss"}:
             raise ValueError("assigner must be either 'fcos' or 'atss'.")
 
@@ -85,6 +88,33 @@ class DenseDetectionLoss(nn.Module):
             raise ValueError("size_ranges must match the number of strides.")
 
     def forward(
+        self,
+        outputs: dict[str, list[torch.Tensor] | tuple[int, ...]],
+        targets: list[dict[str, torch.Tensor]],
+    ) -> LossOutput:
+        main_loss = self._compute_single(outputs, targets)
+        aux_loss = main_loss.total.new_tensor(0.0)
+
+        aux_outputs = outputs.get("aux_outputs")
+        if self.auxiliary_loss_weight > 0.0 and aux_outputs:
+            aux_terms = []
+            for aux_output in aux_outputs:  # type: ignore[assignment]
+                aux_result = self._compute_single(aux_output, targets)
+                aux_terms.append(aux_result.total)
+            if aux_terms:
+                aux_loss = torch.stack(aux_terms).mean()
+
+        total = main_loss.total + self.auxiliary_loss_weight * aux_loss
+        return LossOutput(
+            total=total,
+            cls=main_loss.cls,
+            box=main_loss.box,
+            qual=main_loss.qual,
+            aux=aux_loss,
+            positives=main_loss.positives,
+        )
+
+    def _compute_single(
         self,
         outputs: dict[str, list[torch.Tensor] | tuple[int, ...]],
         targets: list[dict[str, torch.Tensor]],
@@ -188,6 +218,7 @@ class DenseDetectionLoss(nn.Module):
             cls=cls_loss,
             box=box_loss,
             qual=qual_loss,
+            aux=total.new_tensor(0.0),
             positives=total_pos,
         )
 
