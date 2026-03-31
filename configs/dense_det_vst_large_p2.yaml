@@ -20,18 +20,26 @@ train:
   batch_size: 8
   image_size: 640
   num_workers: 2
-  balanced_sampler: false
+  balanced_sampler: true
 
 optimizer:
   lr: 0.0004
 
 scheduler:
-  warmup_epochs: 10
+  warmup_epochs: 3
   eta_min_ratio: 0.01
 
 augmentation:
   enabled: true
-  close_after_epochs: 10
+  close_after_epochs: 5
+  fliplr: 0.5
+  hsv_h: 0.01
+  hsv_s: 0.2
+  hsv_v: 0.2
+  blur_prob: 0.0
+  grayscale_prob: 0.0
+  equalize_prob: 0.0
+  erasing_prob: 0.0
 
 loss:
   assigner: fcos
@@ -46,6 +54,6 @@ eval:
   batch_size: 8
   during_train_every_epochs: 5
   during_train_max_batches:
-  conf_thresh: 0.25
+  conf_thresh: 0.10
   iou_thresh: 0.50
   nms_iou: 0.60
