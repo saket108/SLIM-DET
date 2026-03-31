@@ -834,11 +834,12 @@ def main():
         macro_precision = None if summary is None else summary["macro_precision"]
         macro_recall = None if summary is None else summary["macro_recall"]
         improved = val_loss < best_val
+        in_warmup = epoch <= args.warmup_epochs
         if improved:
             best_val = val_loss
             best_epoch = epoch
             epochs_without_improvement = 0
-        else:
+        elif not in_warmup:
             epochs_without_improvement += 1
         print(
             f"{f'{epoch}/{args.epochs}':<10} "
@@ -928,7 +929,7 @@ def main():
                 epochs_without_improvement=epochs_without_improvement,
             )
 
-        if args.patience and epochs_without_improvement >= args.patience:
+        if args.patience and not in_warmup and epochs_without_improvement >= args.patience:
             print(
                 f"  Early stopping triggered at epoch {epoch}: "
                 f"no val loss improvement for {epochs_without_improvement} epochs "
