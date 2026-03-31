@@ -159,6 +159,14 @@ def parse_args():
     parser.add_argument("--augment", dest="augment", action="store_true")
     parser.add_argument("--no_augment", dest="augment", action="store_false")
     parser.add_argument("--close_augment_after_epochs", type=int, default=None)
+    parser.add_argument("--augment_fliplr", type=float, default=None)
+    parser.add_argument("--augment_hsv_h", type=float, default=None)
+    parser.add_argument("--augment_hsv_s", type=float, default=None)
+    parser.add_argument("--augment_hsv_v", type=float, default=None)
+    parser.add_argument("--augment_blur_prob", type=float, default=None)
+    parser.add_argument("--augment_grayscale_prob", type=float, default=None)
+    parser.add_argument("--augment_equalize_prob", type=float, default=None)
+    parser.add_argument("--augment_erasing_prob", type=float, default=None)
     parser.add_argument("--warmup_epochs", type=int, default=None)
     parser.add_argument("--min_lr_ratio", type=float, default=None)
 
@@ -283,6 +291,26 @@ def resolve_args(args):
             args.close_augment_after_epochs,
             augmentation_cfg.get("close_after_epochs"),
             10,
+        ),
+        "augment_fliplr": coalesce(args.augment_fliplr, augmentation_cfg.get("fliplr"), 0.5),
+        "augment_hsv_h": coalesce(args.augment_hsv_h, augmentation_cfg.get("hsv_h"), 0.015),
+        "augment_hsv_s": coalesce(args.augment_hsv_s, augmentation_cfg.get("hsv_s"), 0.7),
+        "augment_hsv_v": coalesce(args.augment_hsv_v, augmentation_cfg.get("hsv_v"), 0.4),
+        "augment_blur_prob": coalesce(args.augment_blur_prob, augmentation_cfg.get("blur_prob"), 0.01),
+        "augment_grayscale_prob": coalesce(
+            args.augment_grayscale_prob,
+            augmentation_cfg.get("grayscale_prob"),
+            0.01,
+        ),
+        "augment_equalize_prob": coalesce(
+            args.augment_equalize_prob,
+            augmentation_cfg.get("equalize_prob"),
+            0.01,
+        ),
+        "augment_erasing_prob": coalesce(
+            args.augment_erasing_prob,
+            augmentation_cfg.get("erasing_prob"),
+            0.4,
         ),
         "warmup_epochs": coalesce(args.warmup_epochs, scheduler_cfg.get("warmup_epochs"), 10),
         "min_lr_ratio": coalesce(args.min_lr_ratio, scheduler_cfg.get("eta_min_ratio"), 0.01),
@@ -610,6 +638,13 @@ def main():
     print(f"Balanced samp: {args.balanced_sampler}")
     print(f"Augment      : {args.augment}")
     print(f"Aug close ep : {args.close_augment_after_epochs}")
+    print(
+        "Aug params   : "
+        f"flip={args.augment_fliplr}, "
+        f"hsv=({args.augment_hsv_h}, {args.augment_hsv_s}, {args.augment_hsv_v}), "
+        f"blur={args.augment_blur_prob}, gray={args.augment_grayscale_prob}, "
+        f"equalize={args.augment_equalize_prob}, erase={args.augment_erasing_prob}"
+    )
     print(f"Warmup epochs: {args.warmup_epochs}")
     print(f"Dataset root : {args.dataset_root}")
 
@@ -625,6 +660,14 @@ def main():
     train_augmenter = DetectionAugmenter(
         enabled=args.augment,
         close_after_epochs=args.close_augment_after_epochs,
+        fliplr=args.augment_fliplr,
+        hsv_h=args.augment_hsv_h,
+        hsv_s=args.augment_hsv_s,
+        hsv_v=args.augment_hsv_v,
+        blur_prob=args.augment_blur_prob,
+        grayscale_prob=args.augment_grayscale_prob,
+        equalize_prob=args.augment_equalize_prob,
+        erasing_prob=args.augment_erasing_prob,
     )
     train_loader = build_train_loader(
         json_path=args.train_json,
