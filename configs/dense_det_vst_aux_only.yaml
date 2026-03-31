@@ -1,0 +1,51 @@
+model:
+  variant: small
+  backbone_name: vst
+  pretrained_backbone: false
+  neck_name: cafpn
+  head_depth: 2
+  use_detail_branch: false
+  use_quality_head: true
+  use_auxiliary_heads: true
+
+data:
+  format: detection
+  dataset_root:
+  num_classes: 6
+  class_names:
+
+train:
+  epochs: 110
+  patience: 20
+  batch_size: 16
+  image_size: 640
+  num_workers: 2
+  balanced_sampler: false
+
+optimizer:
+  lr: 0.0004
+
+scheduler:
+  warmup_epochs: 10
+  eta_min_ratio: 0.01
+
+augmentation:
+  enabled: false
+  close_after_epochs: 0
+
+loss:
+  assigner: fcos
+  quality: 1.0
+  auxiliary: 0.25
+
+checkpoint:
+  save_dir: runs/dense_det_vst_aux_only
+  save_period_batches: 200
+
+eval:
+  batch_size: 16
+  during_train_every_epochs: 5
+  during_train_max_batches:
+  conf_thresh: 0.25
+  iou_thresh: 0.50
+  nms_iou: 0.60
