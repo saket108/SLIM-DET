@@ -180,6 +180,7 @@ def resolve_args(args):
         'val_labels': val_labels,
         'epochs': coalesce(args.epochs, train_cfg.get('epochs'), 300),
         'batch': coalesce(args.batch, train_cfg.get('batch_size'), 4),
+        'eval_batch': coalesce(eval_cfg.get('batch_size'), args.batch, train_cfg.get('batch_size'), 4),
         'lr': coalesce(args.lr, optimizer_cfg.get('lr'), 4e-4),
         'imgsz': coalesce(args.imgsz, train_cfg.get('image_size'), data_cfg.get('image_size'), 640),
         'hidden_dim': coalesce(args.hidden_dim, model_cfg.get('hidden_dim'), 256),
@@ -201,7 +202,7 @@ def resolve_args(args):
         'workers': (
             args.workers
             if args.workers is not None
-            else (0 if os.name == 'nt' else coalesce(train_cfg.get('num_workers'), 0))
+            else coalesce(train_cfg.get('num_workers'), 0)
         ),
         'balanced_sampler': coalesce(args.balanced_sampler, train_cfg.get('balanced_sampler'), True),
         'save_dir': coalesce(args.save_dir, checkpoint_cfg.get('save_dir'), 'runs/slim_det'),
@@ -508,6 +509,7 @@ def save_checkpoint(
     total_batches=None,
     global_step=None,
     is_mid_epoch=False,
+    best_checkpoint_score=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f'slim_det_{tag}.pt')
@@ -523,6 +525,7 @@ def save_checkpoint(
         'global_step': global_step,
         'is_mid_epoch': is_mid_epoch,
         'model_config': model_config,
+        'best_checkpoint_score': best_checkpoint_score,
     }, path)
     return path
 
@@ -584,7 +587,7 @@ def main():
     val_loader = build_val_loader(
         json_path=args.val_json,
         images_dir=args.val_images,
-        batch_size=args.batch,
+        batch_size=args.eval_batch,
         image_size=args.imgsz,
         prompt_mode=args.prompt_mode,
         num_workers=args.workers,
@@ -614,6 +617,7 @@ def main():
 
     start_epoch = 1
     best_val = float('inf')
+    best_checkpoint_score = float('-inf')
 
     if args.resume:
         ckpt = resume_ckpt or torch.load(args.resume, map_location=device)
@@ -631,6 +635,12 @@ def main():
         else:
             print(f"\nResumed from epoch {ckpt['epoch']}")
         best_val = ckpt.get('val_loss', float('inf'))
+        stored_best_checkpoint_score = ckpt.get('best_checkpoint_score')
+        best_checkpoint_score = (
+            float(stored_best_checkpoint_score)
+            if stored_best_checkpoint_score is not None
+            else -float(best_val)
+        )
 
     print(f"\nStarting training for {args.epochs} epochs...")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -677,6 +687,7 @@ def main():
                 total_batches=total_batches,
                 global_step=global_step,
                 is_mid_epoch=True,
+                best_checkpoint_score=best_checkpoint_score,
             )
             print(
                 f"  Saved mid-epoch checkpoint: {path} "
@@ -721,6 +732,16 @@ def main():
         elapsed = time.time() - t0
         macro_precision = None if summary is None else summary['macro_precision']
         macro_recall = None if summary is None else summary['macro_recall']
+
+        if val_loss < best_val:
+            best_val = val_loss
+
+        checkpoint_score = -float(val_loss)
+        checkpoint_metric_name = 'val_loss'
+        if summary is not None and map5095 != '':
+            checkpoint_score = float(map5095)
+            checkpoint_metric_name = 'map50_95'
+
         print(
             f"{f'{epoch}/{args.epochs}':<10} "
             f"{train_loss:>10.4f} {val_loss:>10.4f} "
@@ -763,10 +784,11 @@ def main():
             total_batches=len(train_loader),
             global_step=epoch * len(train_loader),
             is_mid_epoch=False,
+            best_checkpoint_score=best_checkpoint_score,
         )
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if checkpoint_score > best_checkpoint_score:
+            best_checkpoint_score = checkpoint_score
             save_checkpoint(
                 model,
                 optimizer,
@@ -781,8 +803,12 @@ def main():
                 total_batches=len(train_loader),
                 global_step=epoch * len(train_loader),
                 is_mid_epoch=False,
+                best_checkpoint_score=best_checkpoint_score,
             )
-            print(f"  New best val loss: {best_val:.4f}")
+            if checkpoint_metric_name == 'map50_95':
+                print(f"  New best checkpoint by mAP50-95: {best_checkpoint_score:.4f}")
+            else:
+                print(f"  New best checkpoint by val loss: {best_val:.4f}")
 
         if epoch % 50 == 0:
             save_checkpoint(
@@ -799,6 +825,7 @@ def main():
                 total_batches=len(train_loader),
                 global_step=epoch * len(train_loader),
                 is_mid_epoch=False,
+                best_checkpoint_score=best_checkpoint_score,
             )
 
     print(f"\nTraining complete. Best val loss: {best_val:.4f}")

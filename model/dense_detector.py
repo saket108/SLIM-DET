@@ -571,9 +571,12 @@ def decode_predictions(
             box_distances = box_map[batch_index].permute(1, 2, 0).reshape(-1, 4) * int(stride)
 
             if quality_map is not None:
-                quality = quality_map[batch_index].permute(1, 2, 0).reshape(-1).sigmoid()
+                _quality = quality_map[batch_index].permute(1, 2, 0).reshape(-1).sigmoid()
                 raw_scores, labels = cls_scores.max(dim=1)
-                scores = (raw_scores * quality).sqrt()
+                # The class branch is already trained with IoU-aware varifocal
+                # targets, so multiplying by a second quality score here tends
+                # to over-suppress confidence and reduce recall.
+                scores = raw_scores
             else:
                 scores, labels = cls_scores.max(dim=1)
 

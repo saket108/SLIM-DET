@@ -278,12 +278,13 @@ def resolve_args(args):
         "epochs": coalesce(args.epochs, train_cfg.get("epochs"), 300),
         "patience": coalesce(args.patience, train_cfg.get("patience"), 0),
         "batch": coalesce(args.batch, train_cfg.get("batch_size"), 8),
+        "eval_batch": coalesce(eval_cfg.get("batch_size"), args.batch, train_cfg.get("batch_size"), 8),
         "lr": coalesce(args.lr, optimizer_cfg.get("lr"), 4e-4),
         "imgsz": coalesce(args.imgsz, train_cfg.get("image_size"), data_cfg.get("image_size"), 640),
         "workers": (
             args.workers
             if args.workers is not None
-            else (0 if os.name == "nt" else coalesce(train_cfg.get("num_workers"), 0))
+            else coalesce(train_cfg.get("num_workers"), 0)
         ),
         "balanced_sampler": coalesce(args.balanced_sampler, train_cfg.get("balanced_sampler"), True),
         "augment": coalesce(args.augment, augmentation_cfg.get("enabled"), False),
@@ -445,6 +446,7 @@ def save_checkpoint(
     best_val=None,
     best_epoch=None,
     epochs_without_improvement=None,
+    best_checkpoint_score=None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"dense_det_{tag}.pt")
@@ -464,6 +466,7 @@ def save_checkpoint(
             "best_val": best_val,
             "best_epoch": best_epoch,
             "epochs_without_improvement": epochs_without_improvement,
+            "best_checkpoint_score": best_checkpoint_score,
         },
         path,
     )
@@ -685,7 +688,7 @@ def main():
     val_loader = build_val_loader(
         json_path=args.val_json,
         images_dir=args.val_images,
-        batch_size=args.batch,
+        batch_size=args.eval_batch,
         image_size=args.imgsz,
         prompt_mode="cat_only",
         num_workers=args.workers,
@@ -720,6 +723,7 @@ def main():
     start_epoch = 1
     best_val = float("inf")
     best_epoch = 0
+    best_checkpoint_score = float("-inf")
     epochs_without_improvement = 0
     if args.resume:
         ckpt = resume_ckpt or torch.load(args.resume, map_location=device)
@@ -738,6 +742,12 @@ def main():
             print(f"\nResumed from epoch {ckpt['epoch']}")
         best_val = ckpt.get("best_val", ckpt.get("val_loss", float("inf")))
         best_epoch = int(ckpt.get("best_epoch", 0))
+        stored_best_checkpoint_score = ckpt.get("best_checkpoint_score")
+        best_checkpoint_score = (
+            float(stored_best_checkpoint_score)
+            if stored_best_checkpoint_score is not None
+            else -float(best_val)
+        )
         epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
 
     print(f"\nStarting training for {args.epochs} epochs...")
@@ -790,6 +800,7 @@ def main():
                 best_val=best_val,
                 best_epoch=best_epoch,
                 epochs_without_improvement=epochs_without_improvement,
+                best_checkpoint_score=best_checkpoint_score,
             )
             print(
                 f"  Saved mid-epoch checkpoint: {path} "
@@ -833,10 +844,21 @@ def main():
         elapsed = time.time() - t0
         macro_precision = None if summary is None else summary["macro_precision"]
         macro_recall = None if summary is None else summary["macro_recall"]
-        improved = val_loss < best_val
+
+        val_improved = val_loss < best_val
+        if val_improved:
+            best_val = val_loss
+
+        checkpoint_score = -float(val_loss)
+        checkpoint_metric_name = "val_loss"
+        if summary is not None and map5095 != "":
+            checkpoint_score = float(map5095)
+            checkpoint_metric_name = "map50_95"
+
+        improved = checkpoint_score > best_checkpoint_score
         in_warmup = epoch <= args.warmup_epochs
         if improved:
-            best_val = val_loss
+            best_checkpoint_score = checkpoint_score
             best_epoch = epoch
             epochs_without_improvement = 0
         elif not in_warmup:
@@ -886,6 +908,7 @@ def main():
             best_val=best_val,
             best_epoch=best_epoch,
             epochs_without_improvement=epochs_without_improvement,
+            best_checkpoint_score=best_checkpoint_score,
         )
 
         if improved:
@@ -906,8 +929,12 @@ def main():
                 best_val=best_val,
                 best_epoch=best_epoch,
                 epochs_without_improvement=epochs_without_improvement,
+                best_checkpoint_score=best_checkpoint_score,
             )
-            print(f"  New best val loss: {best_val:.4f}")
+            if checkpoint_metric_name == "map50_95":
+                print(f"  New best checkpoint by mAP50-95: {best_checkpoint_score:.4f}")
+            else:
+                print(f"  New best checkpoint by val loss: {best_val:.4f}")
 
         if epoch % 50 == 0:
             save_checkpoint(
@@ -927,12 +954,13 @@ def main():
                 best_val=best_val,
                 best_epoch=best_epoch,
                 epochs_without_improvement=epochs_without_improvement,
+                best_checkpoint_score=best_checkpoint_score,
             )
 
         if args.patience and not in_warmup and epochs_without_improvement >= args.patience:
             print(
                 f"  Early stopping triggered at epoch {epoch}: "
-                f"no val loss improvement for {epochs_without_improvement} epochs "
+                f"no checkpoint metric improvement for {epochs_without_improvement} epochs "
                 f"(best epoch: {best_epoch}, best val loss: {best_val:.4f})"
             )
             break

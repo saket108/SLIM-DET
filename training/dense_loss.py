@@ -207,7 +207,7 @@ class DenseDetectionLoss(nn.Module):
 
             cls_loss = cls_loss + varifocal_loss(pred_cls[batch_index], cls_targets).sum()
 
-        normalizer = max(total_pos, 10)
+        normalizer = max(total_pos, 1)
         cls_loss = cls_loss / normalizer
         box_loss = box_loss / normalizer
         qual_loss = qual_loss / normalizer

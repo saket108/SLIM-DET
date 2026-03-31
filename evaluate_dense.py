@@ -199,7 +199,7 @@ def resolve_args(args):
         "workers": (
             args.workers
             if args.workers is not None
-            else (0 if os.name == "nt" else coalesce(train_cfg.get("num_workers"), 0))
+            else coalesce(train_cfg.get("num_workers"), 0)
         ),
         "max_batches": args.max_batches,
         "num_classes": num_classes,
