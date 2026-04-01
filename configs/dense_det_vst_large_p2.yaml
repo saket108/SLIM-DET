@@ -43,7 +43,7 @@ augmentation:
 
 loss:
   assigner: fcos
-  quality: 1.0
+  quality: 1.5
   auxiliary: 0.25
 
 checkpoint:

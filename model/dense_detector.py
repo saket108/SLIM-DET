@@ -573,9 +573,8 @@ def decode_predictions(
             if quality_map is not None:
                 quality = quality_map[batch_index].permute(1, 2, 0).reshape(-1).sigmoid()
                 raw_scores, labels = cls_scores.max(dim=1)
-                # Reuse the trained quality branch for ranking while keeping
-                # the geometric mean mild enough to avoid collapsing recall.
-                scores = torch.sqrt((raw_scores * quality).clamp(min=0.0, max=1.0))
+                # Use quality to modulate scores for better precision
+                scores = (raw_scores * quality).clamp(min=0.0, max=1.0)
             else:
                 scores, labels = cls_scores.max(dim=1)
 
