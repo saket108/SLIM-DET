@@ -153,6 +153,7 @@ def parse_args():
     parser.add_argument("--eval_conf", type=float, default=None)
     parser.add_argument("--eval_iou", type=float, default=None)
     parser.add_argument("--eval_nms_iou", type=float, default=None)
+    parser.add_argument("--checkpoint_metric", type=str, default=None, choices=["map50_95", "map50", "val_loss"])
     parser.add_argument("--save_every_batches", type=int, default=None)
     parser.add_argument("--balanced_sampler", dest="balanced_sampler", action="store_true")
     parser.add_argument("--no_balanced_sampler", dest="balanced_sampler", action="store_false")
@@ -338,6 +339,7 @@ def resolve_args(args):
         "eval_conf": coalesce(args.eval_conf, eval_cfg.get("conf_thresh"), 0.25),
         "eval_iou": coalesce(args.eval_iou, eval_cfg.get("iou_thresh"), 0.5),
         "eval_nms_iou": coalesce(args.eval_nms_iou, eval_cfg.get("nms_iou"), 0.6),
+        "checkpoint_metric": coalesce(args.checkpoint_metric, eval_cfg.get("checkpoint_metric"), "map50_95"),
     }
 
     if resolved["data_format"] == "detection":
@@ -493,6 +495,7 @@ def train_one_epoch(
 ):
     model.train()
     total_loss = 0.0
+    processed_batches = 0
     n_batches = len(loader)
     iterator = loader
     progress = None
@@ -557,7 +560,8 @@ def train_one_epoch(
             optimizer.step()
 
         total_loss += loss.item()
-        avg = total_loss / (i + 1)
+        processed_batches += 1
+        avg = total_loss / max(processed_batches, 1)
 
         if progress is not None:
             progress.set_postfix(
@@ -585,7 +589,7 @@ def train_one_epoch(
 
     if progress is not None:
         progress.close()
-    return total_loss / max(n_batches, 1)
+    return total_loss / max(processed_batches, 1)
 
 
 @torch.no_grad()
@@ -649,6 +653,7 @@ def main():
         f"equalize={args.augment_equalize_prob}, erase={args.augment_erasing_prob}"
     )
     print(f"Warmup epochs: {args.warmup_epochs}")
+    print(f"Ckpt metric  : {args.checkpoint_metric}")
     print(f"Dataset root : {args.dataset_root}")
 
     print("\nBuilding DenseDet...")
@@ -746,7 +751,7 @@ def main():
         best_checkpoint_score = (
             float(stored_best_checkpoint_score)
             if stored_best_checkpoint_score is not None
-            else -float(best_val)
+            else (-float(best_val) if args.checkpoint_metric == "val_loss" else float("-inf"))
         )
         epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
 
@@ -849,19 +854,23 @@ def main():
         if val_improved:
             best_val = val_loss
 
-        checkpoint_score = -float(val_loss)
-        checkpoint_metric_name = "val_loss"
-        if summary is not None and map5095 != "":
-            checkpoint_score = float(map5095)
-            checkpoint_metric_name = "map50_95"
+        checkpoint_score = None
+        checkpoint_metric_name = args.checkpoint_metric
+        if args.checkpoint_metric == "val_loss":
+            checkpoint_score = -float(val_loss)
+        elif summary is not None:
+            if args.checkpoint_metric == "map50_95" and map5095 != "":
+                checkpoint_score = float(map5095)
+            elif args.checkpoint_metric == "map50" and map50 != "":
+                checkpoint_score = float(map50)
 
-        improved = checkpoint_score > best_checkpoint_score
+        improved = checkpoint_score is not None and checkpoint_score > best_checkpoint_score
         in_warmup = epoch <= args.warmup_epochs
         if improved:
-            best_checkpoint_score = checkpoint_score
+            best_checkpoint_score = float(checkpoint_score)
             best_epoch = epoch
             epochs_without_improvement = 0
-        elif not in_warmup:
+        elif checkpoint_score is not None and not in_warmup:
             epochs_without_improvement += 1
         print(
             f"{f'{epoch}/{args.epochs}':<10} "
@@ -957,7 +966,12 @@ def main():
                 best_checkpoint_score=best_checkpoint_score,
             )
 
-        if args.patience and not in_warmup and epochs_without_improvement >= args.patience:
+        if (
+            args.patience
+            and checkpoint_score is not None
+            and not in_warmup
+            and epochs_without_improvement >= args.patience
+        ):
             print(
                 f"  Early stopping triggered at epoch {epoch}: "
                 f"no checkpoint metric improvement for {epochs_without_improvement} epochs "

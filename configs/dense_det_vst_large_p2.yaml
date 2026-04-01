@@ -17,10 +17,10 @@ data:
 train:
   epochs: 300
   patience: 20
-  batch_size: 8
+  batch_size: 4
   image_size: 640
   num_workers: 2
-  balanced_sampler: true
+  balanced_sampler: false
 
 optimizer:
   lr: 0.0004
@@ -51,9 +51,10 @@ checkpoint:
   save_period_batches: 200
 
 eval:
-  batch_size: 8
+  batch_size: 4
   during_train_every_epochs: 5
   during_train_max_batches:
   conf_thresh: 0.10
   iou_thresh: 0.50
   nms_iou: 0.60
+  checkpoint_metric: map50_95
