@@ -174,6 +174,7 @@ def parse_args():
     parser.add_argument("--num_classes", type=int, default=None)
     parser.add_argument("--variant", type=str, default=None)
     parser.add_argument("--backbone_name", type=str, default=None)
+    parser.add_argument("--pretrained_backbone_path", type=str, default=None)
     parser.add_argument("--neck_name", type=str, default=None)
     parser.add_argument("--head_depth", type=int, default=None)
     parser.add_argument("--use_auxiliary_heads", dest="use_auxiliary_heads", action="store_true")
@@ -322,6 +323,11 @@ def resolve_args(args):
         "class_names": class_names,
         "variant": coalesce(args.variant, model_cfg.get("variant"), "small"),
         "backbone_name": coalesce(args.backbone_name, model_cfg.get("backbone_name"), "convnext_tiny"),
+        "pretrained_backbone_path": coalesce(
+            args.pretrained_backbone_path,
+            model_cfg.get("pretrained_backbone_path"),
+            None,
+        ),
         "neck_name": coalesce(args.neck_name, model_cfg.get("neck_name"), "cafpn"),
         "head_depth": coalesce(args.head_depth, model_cfg.get("head_depth"), 2),
         "use_detail_branch": coalesce(args.use_detail_branch, model_cfg.get("use_detail_branch"), False),
@@ -371,6 +377,8 @@ def resolve_args(args):
 
     if resolved["resume"] is not None:
         require_existing_paths(resume=resolved["resume"])
+    if resolved["pretrained_backbone_path"] is not None:
+        require_existing_paths(pretrained_backbone_path=resolved["pretrained_backbone_path"])
     return argparse.Namespace(**resolved)
 
 
@@ -380,6 +388,7 @@ def build_model_config(args):
         "variant": args.variant,
         "backbone_name": args.backbone_name,
         "pretrained_backbone": args.pretrained_backbone,
+        "pretrained_backbone_path": args.pretrained_backbone_path,
         "neck_name": args.neck_name,
         "head_depth": args.head_depth,
         "use_detail_branch": args.use_detail_branch,
@@ -410,6 +419,7 @@ def apply_checkpoint_model_config(args, checkpoint):
         "variant",
         "backbone_name",
         "pretrained_backbone",
+        "pretrained_backbone_path",
         "neck_name",
         "head_depth",
         "use_detail_branch",
@@ -635,6 +645,8 @@ def main():
     print(f"Device       : {device}")
     print(f"Data format  : {args.data_format}")
     print(f"Backbone     : {args.backbone_name}")
+    if args.pretrained_backbone_path:
+        print(f"Backbone ckpt: {args.pretrained_backbone_path}")
     print(f"Variant      : {args.variant}")
     print(f"Neck         : {args.neck_name}")
     print(f"Quality head : {args.use_quality_head}")

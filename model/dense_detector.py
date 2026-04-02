@@ -111,13 +111,65 @@ class TimmBackbone(nn.Module):
         return tuple(features[-4:])
 
 
-def build_backbone(model_name: str, pretrained: bool = True) -> nn.Module:
+def _extract_backbone_state_dict(payload: object) -> dict[str, torch.Tensor]:
+    if isinstance(payload, dict):
+        for key in ("backbone", "backbone_state_dict", "state_dict", "model"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                payload = value
+                break
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unsupported pretrained backbone checkpoint format.")
+
+    filtered: dict[str, torch.Tensor] = {}
+    for key, value in payload.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+
+        normalized = key
+        if normalized.startswith("module."):
+            normalized = normalized[len("module.") :]
+        if normalized.startswith("backbone."):
+            normalized = normalized[len("backbone.") :]
+
+        filtered[normalized] = value
+
+    if not filtered:
+        raise ValueError("No tensor weights found in pretrained backbone checkpoint.")
+    return filtered
+
+
+def _load_backbone_weights(backbone: nn.Module, checkpoint_path: str) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _extract_backbone_state_dict(checkpoint)
+    missing, unexpected = backbone.load_state_dict(state_dict, strict=False)
+
+    print(f"  Loaded pretrained backbone weights from: {checkpoint_path}")
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = " ..." if len(missing) > 5 else ""
+        print(f"    Missing keys: {preview}{suffix}")
+    if unexpected:
+        preview = ", ".join(unexpected[:5])
+        suffix = " ..." if len(unexpected) > 5 else ""
+        print(f"    Unexpected keys: {preview}{suffix}")
+
+
+def build_backbone(
+    model_name: str,
+    pretrained: bool = True,
+    pretrained_path: str | None = None,
+) -> nn.Module:
     resolved_name = BACKBONE_ALIASES.get(model_name, model_name)
     if resolved_name in VST_PRESETS:
-        if pretrained:
-            print("  VST backbone uses random initialization only (ignoring pretrained_backbone=True)")
         preset = VST_PRESETS[resolved_name]
-        return VSTBackbone(dims=preset["dims"], depths=preset["depths"])
+        backbone = VSTBackbone(dims=preset["dims"], depths=preset["depths"])
+        if pretrained_path:
+            _load_backbone_weights(backbone, pretrained_path)
+        elif pretrained:
+            print("  VST backbone uses random initialization only (ignoring pretrained_backbone=True)")
+        return backbone
     return TimmBackbone(resolved_name, pretrained=pretrained)
 
 
@@ -425,6 +477,7 @@ class DenseDet(nn.Module):
         variant: str = "small",
         backbone_name: str = "mobilenet",
         pretrained_backbone: bool = True,
+        pretrained_backbone_path: str | None = None,
         neck_name: str = "cafpn",
         head_depth: int = 2,
         use_detail_branch: bool = False,
@@ -441,6 +494,7 @@ class DenseDet(nn.Module):
         self.variant = variant
         self.backbone_name = BACKBONE_ALIASES.get(backbone_name, backbone_name)
         self.pretrained_backbone = pretrained_backbone
+        self.pretrained_backbone_path = pretrained_backbone_path
         self.neck_name = neck_name
         self.head_depth = head_depth
         self.use_detail_branch = use_detail_branch
@@ -448,9 +502,13 @@ class DenseDet(nn.Module):
         self.use_auxiliary_heads = use_auxiliary_heads
         self.auxiliary_strides = tuple(int(value) for value in auxiliary_strides)
 
-        self.backbone = build_backbone(self.backbone_name, pretrained=pretrained_backbone)
+        self.backbone = build_backbone(
+            self.backbone_name,
+            pretrained=pretrained_backbone,
+            pretrained_path=pretrained_backbone_path,
+        )
         if self.backbone_name in VST_PRESETS:
-            self.pretrained_backbone = False
+            self.pretrained_backbone = bool(pretrained_backbone_path)
         self.uses_stride2_path = use_detail_branch or neck_name == "cafpn_p2"
         self.detail_stem = DetailStem(cfg.detail_channels) if self.uses_stride2_path else None
 
